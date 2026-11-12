@@ -1,0 +1,247 @@
+name: Build Desktop Releases
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-release:
+    name: Prepare GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+    steps:
+      - name: Resolve Release target
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            release_tag="$GITHUB_REF_NAME"
+          else
+            echo "Manual dispatch: build-only mode, no Release will be created." >&2
+            release_tag=""
+          fi
+
+          if [[ -n "$release_tag" ]] && ! gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$release_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --title "Reader $release_tag" \
+              --generate-notes
+          fi
+
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "Release target: ${release_tag:-<none, build-only>}"
+
+  build-linux:
+    name: Linux x64 (glibc 2.28 / UOS 25)
+    needs: prepare-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    container:
+      image: registry.cn-hangzhou.aliyuncs.com/linyaps/builder:1.13.8_amd64
+      options: --privileged
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            curl wget ca-certificates git fuse-overlayfs \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            libssl-dev build-essential
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Verify release metadata
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.release_tag }}
+        run: node scripts/check-release-metadata.mjs
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Test frontend
+        working-directory: frontend
+        run: npm test -- --run
+
+      - name: Test Rust core
+        run: cargo test --lib -j 4
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build Tauri bundle (Linux)
+        working-directory: desktop
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: npx tauri build --ci --target x86_64-unknown-linux-gnu --bundles deb -- --locked
+
+      - name: Collect release artifacts
+        env:
+          TAURI_TARGET: x86_64-unknown-linux-gnu
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.release_tag }}
+          RELEASE_PLATFORM: linux
+          RELEASE_ARCH: x64
+        run: node scripts/collect-desktop-artifacts.mjs
+
+      - name: Upload Linux build input
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-linux-x64-input
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload platform files to Release
+        if: ${{ needs.prepare-release.outputs.release_tag != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ needs.prepare-release.outputs.release_tag }}" release/* --clobber
+
+  build-linglong:
+    name: Linglong Layer (UOS 25 / ll-killer)
+    needs: [prepare-release, build-linux]
+    if: ${{ needs.build-linux.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    container:
+      image: registry.cn-hangzhou.aliyuncs.com/linyaps/builder:1.13.8_amd64
+      options: --privileged
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Tauri Linux build input
+        uses: actions/download-artifact@v4
+        with:
+          name: tauri-linux-x64-input
+          path: ./tauri-input
+
+      - name: Install ll-killer
+        run: |
+          apt-get update
+          apt-get install -y wget ca-certificates fuse-overlayfs
+          wget -q https://github.com/System233/ll-killer-go/releases/latest/download/ll-killer-amd64 -O /usr/local/bin/ll-killer
+          chmod +x /usr/local/bin/ll-killer
+          ll-killer -v
+
+      - name: Prepare Linglong project
+        run: |
+          mkdir -p linglong-build
+          cd linglong-build
+          ll-killer build-aux
+          cp -r ../tauri-input/* .
+
+      - name: Create linglong.yaml (UOS 25 base)
+        run: |
+          cat > linglong-build/linglong.yaml <<'EOF'
+          version: "1.0.0.0"
+          package:
+            id: org.example.reader
+            name: reader
+            version: 1.0.0.0
+            kind: app
+            description: |
+              Reader desktop application built with Tauri 2, packaged as Linglong layer.
+          base: org.deepin.base/25.2.2
+          build: |
+            set -e
+            if ls *.deb 1>/dev/null 2>&1; then
+              dpkg-deb -x ./*.deb "$PREFIX"
+            fi
+            if [ -f reader ]; then
+              install -Dm755 reader "$PREFIX/bin/reader"
+            fi
+            ls -la "$PREFIX/share/applications/" || true
+            ls -la "$PREFIX/share/icons/" || true
+          EOF
+          # 请将 org.example.reader / reader / 1.0.0.0 替换为你的真实包名、二进制名和版本
+
+      - name: Build Linglong layer
+        working-directory: linglong-build
+        run: |
+          ll-killer layer build
+          ls -lh ./*.layer
+
+      - name: Upload Linglong layer as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linglong-layer
+          path: linglong-build/*.layer
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Linglong layer to Release
+        if: ${{ needs.prepare-release.outputs.release_tag != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload \
+            "${{ needs.prepare-release.outputs.release_tag }}" \
+            linglong-build/*.layer \
+            --clobber
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - prepare-release
+      - build-linux
+      - build-linglong
+    if: ${{ always() && needs.prepare-release.outputs.release_tag != '' && needs.build-linux.result == 'success' && needs.build-linglong.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish completed Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
+        run: |
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --latest
