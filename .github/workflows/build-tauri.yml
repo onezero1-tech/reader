@@ -1,247 +1,81 @@
-name: Build Desktop Releases
+# 在 GitHub Actions 上构建 Reader 的玲珑包（amd64 layer）
+#
+# 使用方法：把本工程目录（linglong.yaml、install_dep、.github/）的内容
+# 作为仓库根目录推送到 GitHub 即可自动触发构建。
+#
+# 产物：*.layer（玲珑安装包），在 Actions 页面下载，或推 tag 时自动发布到 Release。
+# 安装：在 UOS 20 上执行 ll-cli install ./com.hadc188.reader_1.6.5.0_x86_64_binary.layer
+
+name: Build Linglong Package
 
 on:
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+    branches: ["main", "master", "ci-test"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch: {}
 
 concurrency:
-  group: desktop-release-${{ github.ref }}
-  cancel-in-progress: false
+  group: build-linglong-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  prepare-release:
-    name: Prepare GitHub Release
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    outputs:
-      release_tag: ${{ steps.release.outputs.release_tag }}
-    steps:
-      - name: Resolve Release target
-        id: release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            release_tag="$GITHUB_REF_NAME"
-          else
-            echo "Manual dispatch: build-only mode, no Release will be created." >&2
-            release_tag=""
-          fi
-
-          if [[ -n "$release_tag" ]] && ! gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$release_tag" \
-              --repo "$GITHUB_REPOSITORY" \
-              --draft \
-              --title "Reader $release_tag" \
-              --generate-notes
-          fi
-
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-          echo "Release target: ${release_tag:-<none, build-only>}"
-
-  build-linux:
-    name: Linux x64 (glibc 2.28 / UOS 25)
-    needs: prepare-release
+  build:
+    name: ll-builder build (x86_64)
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    permissions:
-      contents: write
-    container:
-      image: registry.cn-hangzhou.aliyuncs.com/linyaps/builder:1.13.8_amd64
-      options: --privileged
-    env:
-      DEBIAN_FRONTEND: noninteractive
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      # Tauri/Rust 构建产物很大，腾出磁盘空间（base 层 + cargo target 约 10GB+）
+      - name: Free disk space
         run: |
-          apt-get update
-          apt-get install -y \
-            curl wget ca-certificates git fuse-overlayfs \
-            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
-            libssl-dev build-essential
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            frontend/package-lock.json
-            desktop/package-lock.json
+      # 安装如意玲珑构建工具链（官方 release 仓库，适用于 Ubuntu 24.04 托管运行器）
+      - name: Install linglong toolchain
+        run: |
+          echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Ubuntu_24.04/ ./" \
+            | sudo tee /etc/apt/sources.list.d/linglong.list
+          sudo apt-get update
+          sudo apt-get install -y linglong-builder linglong-box linglong-bin
+          ll-cli --version
+          ll-builder --version || true
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
+      # 构建容器内会自动拉取 git 源码、Node 22、Rust 与全部 deb 依赖并编译
+      - name: Build
+        run: ll-builder build -v
 
-      - name: Verify release metadata
-        env:
-          RELEASE_VERSION: ${{ needs.prepare-release.outputs.release_tag }}
-        run: node scripts/check-release-metadata.mjs
+      # 导出玲珑 layer 安装包（binary + develop）
+      - name: Export layer
+        run: ll-builder export --layer
 
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm ci
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          find . -maxdepth 2 -name "*.layer" -not -path "./dist/*" -exec cp -v {} dist/ \;
+          ls -lh dist/
 
-      - name: Build frontend
-        working-directory: frontend
-        run: npm run build
-
-      - name: Test frontend
-        working-directory: frontend
-        run: npm test -- --run
-
-      - name: Test Rust core
-        run: cargo test --lib -j 4
-
-      - name: Install desktop dependencies
-        working-directory: desktop
-        run: npm ci
-
-      - name: Build Tauri bundle (Linux)
-        working-directory: desktop
-        env:
-          CARGO_BUILD_JOBS: 4
-        run: npx tauri build --ci --target x86_64-unknown-linux-gnu --bundles deb -- --locked
-
-      - name: Collect release artifacts
-        env:
-          TAURI_TARGET: x86_64-unknown-linux-gnu
-          RELEASE_VERSION: ${{ needs.prepare-release.outputs.release_tag }}
-          RELEASE_PLATFORM: linux
-          RELEASE_ARCH: x64
-        run: node scripts/collect-desktop-artifacts.mjs
-
-      - name: Upload Linux build input
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tauri-linux-x64-input
-          path: release/*
+          name: reader-linglong-layer
+          path: dist/*.layer
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
-      - name: Upload platform files to Release
-        if: ${{ needs.prepare-release.outputs.release_tag != '' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ needs.prepare-release.outputs.release_tag }}" release/* --clobber
-
-  build-linglong:
-    name: Linglong Layer (UOS 25 / ll-killer)
-    needs: [prepare-release, build-linux]
-    if: ${{ needs.build-linux.result == 'success' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    permissions:
-      contents: write
-    container:
-      image: registry.cn-hangzhou.aliyuncs.com/linyaps/builder:1.13.8_amd64
-      options: --privileged
-    env:
-      DEBIAN_FRONTEND: noninteractive
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download Tauri Linux build input
-        uses: actions/download-artifact@v4
-        with:
-          name: tauri-linux-x64-input
-          path: ./tauri-input
-
-      - name: Install ll-killer
-        run: |
-          apt-get update
-          apt-get install -y wget ca-certificates fuse-overlayfs
-          wget -q https://github.com/System233/ll-killer-go/releases/latest/download/ll-killer-amd64 -O /usr/local/bin/ll-killer
-          chmod +x /usr/local/bin/ll-killer
-          ll-killer -v
-
-      - name: Prepare Linglong project
-        run: |
-          mkdir -p linglong-build
-          cd linglong-build
-          ll-killer build-aux
-          cp -r ../tauri-input/* .
-
-      - name: Create linglong.yaml (UOS 25 base)
-        run: |
-          cat > linglong-build/linglong.yaml <<'EOF'
-          version: "1.0.0.0"
-          package:
-            id: org.example.reader
-            name: reader
-            version: 1.0.0.0
-            kind: app
-            description: |
-              Reader desktop application built with Tauri 2, packaged as Linglong layer.
-          base: org.deepin.base/25.2.2
-          build: |
-            set -e
-            if ls *.deb 1>/dev/null 2>&1; then
-              dpkg-deb -x ./*.deb "$PREFIX"
-            fi
-            if [ -f reader ]; then
-              install -Dm755 reader "$PREFIX/bin/reader"
-            fi
-            ls -la "$PREFIX/share/applications/" || true
-            ls -la "$PREFIX/share/icons/" || true
-          EOF
-          # 请将 org.example.reader / reader / 1.0.0.0 替换为你的真实包名、二进制名和版本
-
-      - name: Build Linglong layer
-        working-directory: linglong-build
-        run: |
-          ll-killer layer build
-          ls -lh ./*.layer
-
-      - name: Upload Linglong layer as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: linglong-layer
-          path: linglong-build/*.layer
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload Linglong layer to Release
-        if: ${{ needs.prepare-release.outputs.release_tag != '' }}
-        shell: bash
+      # 推送 v* 标签时，自动把 layer 发布到 GitHub Release
+      - name: Release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload \
-            "${{ needs.prepare-release.outputs.release_tag }}" \
-            linglong-build/*.layer \
-            --clobber
-
-  publish-release:
-    name: Publish GitHub Release
-    needs:
-      - prepare-release
-      - build-linux
-      - build-linglong
-    if: ${{ always() && needs.prepare-release.outputs.release_tag != '' && needs.build-linux.result == 'success' && needs.build-linglong.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - name: Publish completed Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
-        run: |
-          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --latest
+          gh release create "$GITHUB_REF_NAME" dist/*.layer \
+            --title "Reader 玲珑包 $GITHUB_REF_NAME" \
+            --generate-notes || \
+          gh release upload "$GITHUB_REF_NAME" dist/*.layer --clobber
