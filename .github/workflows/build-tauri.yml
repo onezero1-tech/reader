@@ -1,12 +1,22 @@
 # 在 GitHub Actions 上构建 Reader 的玲珑包（amd64 layer）
 #
-# 使用方法：把本工程目录（linglong.yaml、install_dep、.github/）的内容
-# 作为仓库根目录推送到 GitHub 即可自动触发构建。
+# 流水线拆分为两个独立 job，互不拖累：
+#   1. build-binary    在 ubuntu-24.04 上编译前端 + Rust 主程序（带 npm/Rust 缓存，
+#                      失败重跑只需重新编译增量部分，一般 5~10 分钟）
+#   2. package-linglong  用 ll-builder 把预编译二进制 + webkit/托盘/字体依赖打包成
+#                      .layer（base 层与 deb 依赖有缓存，一般 3~5 分钟）
 #
-# 产物：*.layer（玲珑安装包），在 Actions 页面下载，或推 tag 时自动发布到 Release。
+# 产物：*.layer 在 Actions 页面下载；推 v* 标签时自动发布到 GitHub Release。
 # 安装：在 UOS 20 上执行 ll-cli install ./com.hadc188.reader_1.6.5.0_x86_64_binary.layer
+#
+# 升级 Reader 版本时：更新下方 READER_REF（reader 仓库的 commit）和 linglong.yaml 里的 version。
 
 name: Build Linglong Package
+
+env:
+  # 要打包的 reader 源码版本（commit）
+  READER_REPO: onezero1-tech/reader
+  READER_REF: dba5d36ce3eae900f2521ad1cb81fd03b96e70e8
 
 on:
   push:
@@ -21,20 +31,102 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: ll-builder build (x86_64)
+  # ---------- Job 1：编译 reader-desktop（Rust + Vue 前端） ----------
+  build-binary:
+    name: Build reader-desktop (x86_64)
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout reader source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.READER_REPO }}
+          ref: ${{ env.READER_REF }}
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      # 链接期只需要 -dev 头文件与 .so，运行期由玲珑 layer 自带 deepin 版 webkit/托盘库
+      - name: Install link-time dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev pkg-config file
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # Rust 增量编译缓存：命中后 cargo 编译从 30 分钟降到 5 分钟左右
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Build frontend (Vue 3)
+        run: |
+          cd frontend
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Build desktop (Tauri v2, no bundle)
+        run: |
+          cd desktop
+          npm ci --no-audit --no-fund
+          npx tauri build --no-bundle
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p stage/icons
+          cp -v desktop/src-tauri/target/release/reader-desktop stage/
+          cp -v desktop/src-tauri/icons/128x128.png stage/icons/
+          cp -v desktop/src-tauri/icons/icon.png stage/icons/
+          ls -lhR stage/
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader-desktop
+          path: stage/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------- Job 2：打包成玲珑 layer ----------
+  package-linglong:
+    name: Package linglong layer (x86_64)
+    needs: build-binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     env:
       # ll-builder / linglong-box 在无桌面环境的 CI 上必须有可写的 XDG_RUNTIME_DIR
       XDG_RUNTIME_DIR: /run/user/1001
 
     steps:
-      - name: Checkout
+      - name: Checkout packaging project
         uses: actions/checkout@v4
 
-      # 缓存玲珑 base 层与已下载的源码/依赖（首次构建约 5~10GB，命中后可省 15+ 分钟）
+      # 预编译产物放到项目根目录：构建容器内可见为 /project/reader-desktop 与 /project/icons/
+      - name: Download prebuilt binary
+        uses: actions/download-artifact@v4
+        with:
+          name: reader-desktop
+          path: .
+
+      - name: Verify staged files
+        run: |
+          test -f reader-desktop
+          test -f icons/128x128.png
+          test -f icons/icon.png
+          ls -lh reader-desktop icons/
+
+      # 缓存玲珑 base 层与 65 个 deb 依赖（首次约 5~10GB，命中后打包 job 只需 3~5 分钟）
       - name: Cache linglong builder
         uses: actions/cache@v4
         with:
@@ -42,7 +134,6 @@ jobs:
           key: linglong-builder-cache-x86_64
           restore-keys: linglong-builder-cache-x86_64
 
-      # Tauri/Rust 构建产物很大，腾出磁盘空间（base 层 + cargo target 约 10GB+）
       - name: Free disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
@@ -59,8 +150,7 @@ jobs:
           ll-cli --version
           ll-builder --version || true
 
-      # 构建：容器内会自动拉取 git 源码、Node 22、Rust 与全部 deb 依赖并编译
-      - name: Build
+      - name: Build layer
         run: |
           sudo mkdir -p "$XDG_RUNTIME_DIR"
           sudo chown -R 1001:1001 "$XDG_RUNTIME_DIR"
@@ -68,7 +158,6 @@ jobs:
           # 注意：ll-builder 1.14+ 已移除 -v/--verbose 选项
           ll-builder build
 
-      # 导出玲珑 layer 安装包（binary + develop）
       - name: Export layer
         run: ll-builder export --layer
 
@@ -78,7 +167,7 @@ jobs:
           find . -maxdepth 2 -name "*.layer" -not -path "./dist/*" -exec cp -v {} dist/ \;
           ls -lh dist/
 
-      - name: Upload artifacts
+      - name: Upload layer artifact
         uses: actions/upload-artifact@v4
         with:
           name: reader-linglong-layer
