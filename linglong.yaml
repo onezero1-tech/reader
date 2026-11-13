@@ -17,235 +17,32 @@ command: [start-reader]
 # 构建前直接报 "base version is not valid"（apps/ll-builder/src/main.cpp 的
 # Version::validateDependVersion 正则限制）。官方 Tauri demo 同样写 25.2.0，
 # 由 ll-builder 自动解析到该系列最新版本（当前为 25.2.0.94，仅含 binary 模块）。
-# 本工程不在构建容器内编译 Rust，只解 deb + 拷贝预编译二进制，因此不需要
+# 本工程不在构建容器内编译 Rust，只拷贝预编译二进制，因此不需要
 # base 的 develop 模块——缺失时 ll-builder 仅打印警告，不影响构建。
 base: org.deepin.base/25.2.0
 
-sources:
-  # 说明：主程序 reader-desktop 与图标由 CI 的 build-binary job 编译后作为 artifact 下载到
-  # 本项目根目录（挂载进构建容器后位于 /project/），因此这里不再需要 git 源。
-
-  # ---------- webkit2gtk-4.1 及其依赖（基于官方 Tauri 示例 cn.linyaps.tauri.demo） ----------
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/i/igerman98/aspell-de_20161207-9_all.deb
-    digest: 124abf699c146ad654c5f52f08a20f37936aa56f6b020c4a31e8ed2bcd697136
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/a/aspell/aspell_0.60.8-6_amd64.deb
-    digest: d0a1cf2583ca5ed794671c4156ff6d03c7ceb7166c8d752f828f17ebdde4c7b6
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/b/bubblewrap/bubblewrap_0.10.0-1_amd64.deb
-    digest: e82acc13972c1d2f717ce85ca7a48b6368acad650cb9be60f97ba32bc62ee3b0
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/d/dbus-broker/dbus-broker_29-3_amd64.deb
-    digest: 68ff1baedb2f4ced1ff5d2f9c3e59bd21e741b7710931e0539c89ef5951df8ba
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/f/fonts-noto/fonts-croscore_20201225-deepin_all.deb
-    digest: afbaf120869a08aa7dd14da9ad014de48a751aa4330534b531410bb86c411b55
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/f/fonts-freefont/fonts-freefont-otf_20120503-10_all.deb
-    digest: c66666da94b9a0477351ee9d6d7a247a0a3c842e428da770991b45f03be2ee72
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/f/fonts-freefont/fonts-freefont-ttf_20120503-10_all.deb
-    digest: 79b23c3945d4628463672a804a0e81bc4c262ef87cb6316afb40167a50bc3145
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/f/fonts-liberation/fonts-liberation_2.1.5-3_all.deb
-    digest: 9285213fd8d6515bc6c1be5b810bf39918a668a17024a9fd3541879ce7fb5344
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/t/tex-gyre/fonts-texgyre_20180621-3.1_all.deb
-    digest: f66d6f798c4b99d8490558cc8209c069b0fe5577c11378c0e01f9e87ddf10824
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/g/gst-plugins-base1.0/gstreamer1.0-plugins-base_1.24.6-1_amd64.deb
-    digest: 3a15070887e53d04d0866eded24713e905f78309ead3da0bf4710654406a082f
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/g/gst-plugins-good1.0/gstreamer1.0-plugins-good_1.24.6-1deepin1+rb1_amd64.deb
-    digest: 7cf975e4a6a3408354939c982a922698d22c9c59f9e9cb6a044b7e2257f121e8
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/s/scowl/hunspell-en-us_2020.12.07-1_all.deb
-    digest: 6a8253970b5399571a39d53de050d169ed3eae866aa656b0dea37531a68549de
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/b/br.ispell/ibrazilian_3.0~beta4-23_all.deb
-    digest: 271a5d6c7cb4af761d0f8453843eeed532c5669f8cd699bff8ccf3c4ae74e4fa
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/i/ispell/ispell_3.4.02-2_amd64.deb
-    digest: 2db3cd70af980d785fe5701f824cbbbdc8bc8a1d0258494e95fb74a2a6aec158
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/a/aalib/libaa1_1.4p5-50_amd64.deb
-    digest: 7a3de1da3ffd08698978bfab35bb32d959fa479ccf8b30d35fc9f0723fd7e973
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/a/aspell/libaspell15_0.60.8-6_amd64.deb
-    digest: 48f3715adf9e0fb486f9f89778d357d2c8c81a4246fdfc0057bdbf0c405c190b
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/g/gcc-13/libatomic1_13.2.0-3deepin4_amd64.deb
-    digest: 7cbfd9612f03e31bb16d7226c083d23c8fa1f073fcbac2d09af4df96302b7f21
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/liba/libavc1394/libavc1394-0_0.5.4-5_amd64.deb
-    digest: 27a869ad9b0f6673fe4c6e6dc6aae04f58b550fa9f2de4c9c9ba64cda6e9937a
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libc/libcaca/libcaca0_0.99.beta20-4deepin0_amd64.deb
-    digest: eef9bf124cff1a9617eb134d328b3862d6e1396783fbfe922b9cead4637fb9d5
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/c/cdparanoia/libcdparanoia0_3.10.2+debian-14_amd64.deb
-    digest: bf47490b840a1f50b2a98f453dc3ec61c3f52913e8ca6f74533100c8bd48ac2b
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/e/enchant-2/libenchant-2-2_2.3.3-2_amd64.deb
-    digest: 6bf41db97a6589eee69a6598ce2bc2943e39dd5a1b679f00185bb40bbc487896
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libe/libevdev/libevdev2_1.12.0+dfsg-1_amd64.deb
-    digest: 48c0a7c73d835054b291645fa21fd597271e28a6eb98d8b22f2283e364e83893
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libf/libfile-find-rule-perl/libfile-find-rule-perl_0.34-1_all.deb
-    digest: 8ebc94473bf3381e34408415da523e390c2fb3be418f3c298deb6bc82373ded5
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/f/flite/libflite1_2.2-6_amd64.deb
-    digest: b051da086707e0aa6576b97646a5f4ab6a4d0ef16e1657d06bee41d50d2be9af
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libg/libgav1/libgav1-0_0.17.0-1_amd64.deb
-    digest: a4589dc11a92741054acd8ea7e7c53557cc38a7a0ae44e0c164219e8da298110
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/g/gpm/libgpm2_1.20.7-9_amd64.deb
-    digest: c00c715e31122bef570e1ffc5fbb122e4f0fc54f717b40dd1866aa577ca69339
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/g/gssdp/libgssdp-1.6-0_1.6.2-2_amd64.deb
-    digest: be889b9f488dfb7caa598230fbc39e65d91e552cb6082c4d4757de66d61ae02b
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/g/gst-plugins-base1.0/libgstreamer-gl1.0-0_1.24.6-1_amd64.deb
-    digest: 5e0621339870e5af412c689c0fc54313fa60f09c94262689c3b0b8fd6dead35d
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/g/gst-plugins-bad1.0/libgstreamer-plugins-bad1.0-0_1.24.6-1deepin1_amd64.deb
-    digest: a6b820cc9fbc7b9a022657405031c73f81b54615d328c26c5a3066360b9d033c
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libg/libgudev/libgudev-1.0-0_238-2deepin1_amd64.deb
-    digest: fb9f1c72e40fd7fece5eab37c9eb473bf3d19c84fb808512d60af3bc909a8c5f
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/g/gupnp/libgupnp-1.6-0_1.6.3-1_amd64.deb
-    digest: b99969e9abb77fc8840f1f4b2ab33fac849c3313e09ec95cc71772ce9902bc0a
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/g/gupnp-igd/libgupnp-igd-1.6-0_1.6.0-3_amd64.deb
-    digest: 0288bcf567dbfc64b440d737e76a771073c20c3444a6821739084afcb62f27f1
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/h/hunspell/libhunspell-1.7-0_1.7.0-4_amd64.deb
-    digest: 79fd52b00d64290c91bc3331a52203a9972967711d3587f8abd6326ae61f4d47
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/h/hyphen/libhyphen0_2.8.8-7_amd64.deb
-    digest: d4d72b7419db3fb7bb9663d30c2336eee0244bee22fc8b7bdec37e266bb17ace
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/w/webkit2gtk/libjavascriptcoregtk-4.1-0_2.48.0-1_amd64.deb
-    digest: 6addc315fbef11d7dbffec75be9b928ceca5975c2a2142df68f596bc297e95aa
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libm/libmanette/libmanette-0.2-0_0.2.6-3_amd64.deb
-    digest: b5506c6c22c38db3ec4ade518c0603e76bcce5d8eb9ce62fdfb5805d3a88a31e
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/m/mpg123/libmpg123-0_1.32.8-1deepin1_amd64.deb
-    digest: 8da2a921507884c5bb32854be4feaa1fcf5cd51d5d41b413e0f75982ad578a9f
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libn/libnice/libnice10_0.1.21-2_amd64.deb
-    digest: 2f015d4f7d3c7484b736bd960f8ff4729333867065b081cc36445f419bb50075
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libn/libnumber-compare-perl/libnumber-compare-perl_0.03-2_all.deb
-    digest: c37a63d53d982b9596a8e498e9ef95cf07cc245eaa2a8df8fc8546e82511fa7c
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/o/opencore-amr/libopencore-amrnb0_0.1.5-1_amd64.deb
-    digest: ed16bb492bba32dfcc90bbc65c77903c27354c907fcdbe96d86b35e3b3e836a2
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/o/opencore-amr/libopencore-amrwb0_0.1.5-1_amd64.deb
-    digest: 0edde1c02bf7dc2c1f7cc4c44996e7e7ac73bd89e457ccec2d0a29d66ab0dbf1
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libs/libsecret/libsecret-1-0_0.21.4-1_amd64.deb
-    digest: 3f0d57a746a87803d4ac369c23f451cfd3dea8fb2d90890486d7bbb33d8e747e
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libs/libsecret/libsecret-common_0.21.4-1_all.deb
-    digest: 2c12c067604e4872a281ddd17347c2a8bfa35ec65c086d46aed37414786205ab
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libs/libshout/libshout3_2.4.5-1_amd64.deb
-    digest: b7d0c8f00e6353ddecc9429a2687cf123f251b5a0500336a328b65a4ce5d4042
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/s/slang2/libslang2_2.3.2-5_amd64.deb
-    digest: d0d482e555d5fb78b0606cb2a54a24f071a5389f216f348f4d210e2b57ecf4ed
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libs/libsoup3/libsoup-3.0-0_3.4.3-1_amd64.deb
-    digest: 9888c53cf0e3cedfe9c8f06e3e08d225b063843874a74f9d74518cb25fc182e6
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libs/libsoup3/libsoup-3.0-common_3.4.3-1_all.deb
-    digest: 1591543d840396ea47f24a2b3287dabc0a50eeb085e07f0807cd99a4ca992f13
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/t/taglib/libtag1v5-vanilla_1.12-1deepin0_amd64.deb
-    digest: 4fdd6319d141f7950b7a0581b38a34f9a2e63f35a8ff38b2ed13a7a77e80e90e
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/t/taglib/libtag1v5_1.12-1deepin0_amd64.deb
-    digest: 6981b6a6a11c8e04e81c0e149166261c159f4860055f0dd25e3ed3cdffd14fa7
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libt/libtext-glob-perl/libtext-glob-perl_0.11-2_all.deb
-    digest: 2e8cf563b486b56b4c875db16a37e5e24168085510b8bfd167efc8367cdcad1f
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libv/libvisual/libvisual-0.4-0_0.4.0-17_amd64.deb
-    digest: d8d2635755c1d7f682572b1e440495f0234dbaa87c003431e3e5177d7679e7af
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/w/wavpack/libwavpack1_5.4.0-1_amd64.deb
-    digest: 4ac1acbfdd1a76a3e42bc193729cb09e7daab9e076223aed2400817b652877f4
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/w/webkit2gtk/libwebkit2gtk-4.1-0_2.48.0-1_amd64.deb
-    digest: 9c13c47584ab12c63559364f94c2579237e94d974093e32ad53884e436d7828a
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/w/woff2/libwoff1_1.0.2-1-deepin1_amd64.deb
-    digest: 92a25161de8298a529c3e8158ae21b4343c513e16cac6946a0ffa1166dba72db
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libx/libxslt/libxslt1.1_1.1.34-4_amd64.deb
-    digest: 57b60e3910615c73c78c090eb6f5a3d69c13638e2f212fe651a610e6b6d72ced
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/liby/libyuv/libyuv0_0.0.1888.20240710-3_amd64.deb
-    digest: ee79d2e37a74fff74155751702fc35a4623f23093950fecb5cadb80dc23b9f6c
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/m/myspell-fa/myspell-fa_0.20070816-3.2_all.deb
-    digest: fcd6b94d6e806790ee905d61deae2b08a01bd5523ca90dfcbfef24e5f39f0245
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/u/usrmerge/usrmerge_39+nmu2deepin1_all.deb
-    digest: 544feca0992471720cd5648cf88b0241df5d32cf72c2037ab5d19fd617a15a29
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/x/xdg-dbus-proxy/xdg-dbus-proxy_0.1.2-2_amd64.deb
-    digest: c3b1d158ff9817f081886255c70743563df35a871731f5a0f2b2b8ff35405a7d
-
-  # ---------- 系统托盘依赖 + 中文字体 ----------
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/liba/libayatana-appindicator/libayatana-appindicator3-1_0.5.92-1_amd64.deb
-    digest: 7d99d7be64d2e9311c0f7bd45c56ed57b89ab05a6a4a9116a26ab18d3bd9dfa4
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/liba/libayatana-indicator/libayatana-indicator3-7_0.9.3-1_amd64.deb
-    digest: 3b7d3637827d23478b25d95525bd741e67987bdc5234195359ea89598f23ca74
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/a/ayatana-ido/libayatana-ido3-0.4-0_0.10.1-1_amd64.deb
-    digest: 09d81b029733bd27afc81b3c61fccd64615c30a1bcc7bff4c993f1d7d3b9a5b7
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libd/libdbusmenu/libdbusmenu-gtk3-4_18.10.20180917~bzr492+repack1-deepin1_amd64.deb
-    digest: 3eed21075d074284272fa913011f47d48e2b136e3e9a9b7aaf38450312d93bc1
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libd/libdbusmenu/libdbusmenu-glib4_18.10.20180917~bzr492+repack1-deepin1_amd64.deb
-    digest: 5cc2ae8f9032e247d6648ead0a8328233d34ed51ce5e472255611fc0e9e801de
-  - kind: file
-    url: https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/f/fonts-noto-cjk/fonts-noto-cjk_20240730+repack1-1_all.deb
-    digest: 7171f1f8b656d6aac907cfe296faafc87522d5a63d355f4099cc6ee467986597
+# webkit2gtk-4.1 等运行库不再以 file sources 方式进容器解包：25.2.0 系列
+# 最新 base（25.2.0.94）的 binary 模块是精简 rootfs，没有 apt-get、binutils、
+# zstd 等工具，容器内无法解包 deb。改为在宿主机 runner 上执行
+# prepare_payload.sh（依赖清单 debs.txt，含 sha256 校验）预解包到 payload/，
+# 随工程挂载进容器（/project/payload）后由下方 build 脚本直接拷贝。
 
 build: |
   set -e
 
-  # 本阶段只打包，不编译：Rust/前端已在 build-binary job 用带缓存的独立 job 编译完成，
-  # 二进制与图标经 artifact 放到项目根目录，构建容器内挂在 /project 下。
+  # 本阶段在构建容器内只做纯拷贝与 sed 修补，不联网、不需要 apt/gcc/patchelf：
+  # deb 解包与 RUNPATH 修补已在宿主机 prepare_payload.sh 完成，
+  # 主程序由 build-binary job 预编译后经 artifact 放到项目根目录。
   test -f /project/reader-desktop || { echo "ERROR: /project/reader-desktop missing"; ls -la /project; exit 1; }
   test -f /project/icons/128x128.png || { echo "ERROR: /project/icons missing"; exit 1; }
+  test -d /project/payload/usr || { echo "ERROR: /project/payload missing (prepare_payload.sh 未执行?)"; ls -la /project; exit 1; }
 
-  # 构建容器内没有 HOME 也没有 PATH（ll-builder 1.14 只注入 PREFIX/TRIPLET 等少量变量），
-  # 因此所有环境变量必须显式声明，使用固定绝对路径，绝不依赖 $HOME
-  export HOME=/opt/buildhome
-  export LANG=C.UTF-8
-  mkdir -p "$HOME"
-
-  # ---------- 0. 配置 apt 源并安装解包工具（只打包不编译，无需 gcc） ----------
-  echo 'deb [trusted=yes] https://ci.deepin.com/repo/deepin/deepin-community/stable/ crimson release main community' > /etc/apt/sources.list
-  apt-get update
-  apt-get install -y --no-install-recommends zstd patchelf binutils file xz-utils curl ca-certificates
-  command -v patchelf >/dev/null || { echo "ERROR: patchelf not available"; exit 1; }
-
-  # ---------- 1. 把 webkit2gtk-4.1 / 托盘 / 字体依赖解压到 $PREFIX ----------
-  bash ./install_dep linglong/sources $PREFIX
+  # ---------- 1. 拷贝预解包的 webkit2gtk-4.1 / 托盘 / 字体依赖到 $PREFIX ----------
+  # 与官方 install_dep 相同：只取 lib、bin、usr 三类路径，其余（etc 等）交给 base
+  cp -rP /project/payload/lib $PREFIX/ 2>/dev/null || true
+  cp -rP /project/payload/bin $PREFIX/ 2>/dev/null || true
+  cp -rP /project/payload/usr/. $PREFIX/
+  cp /project/payload/packages.list $PREFIX/packages.list
 
   # ---------- 2. 安装主程序（预编译产物） ----------
   install -Dm755 /project/reader-desktop $PREFIX/bin/reader
