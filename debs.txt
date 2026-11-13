@@ -1,5 +1,3 @@
-AIGC: {"Label":"1","ContentProducer":"001191110108MA01KP2T5U00000","ProduceID":"44ee297b-c440-40ab-85c2-92a251c262fe","ReservedCode1":"","ContentPropagator":"001191110108MA01KP2T5U00000","PropagateID":"44ee297b-c440-40ab-85c2-92a251c262fe","ReservedCode2":""}
-
 https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/i/igerman98/aspell-de_20161207-9_all.deb  124abf699c146ad654c5f52f08a20f37936aa56f6b020c4a31e8ed2bcd697136
 https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/a/aspell/aspell_0.60.8-6_amd64.deb  d0a1cf2583ca5ed794671c4156ff6d03c7ceb7166c8d752f828f17ebdde4c7b6
 https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/b/bubblewrap/bubblewrap_0.10.0-1_amd64.deb  e82acc13972c1d2f717ce85ca7a48b6368acad650cb9be60f97ba32bc62ee3b0
