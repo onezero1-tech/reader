@@ -13,10 +13,13 @@ package:
 
 command: [start-reader]
 
-# 注意：不能写裸版本 25.2.0 —— ll-builder 会解析到最新的 25.2.0.94，而官方仓库里
-# .94 只有 binary 模块没有 develop 模块，构建容器会缺 apt/gcc 等全部工具。
-# 25.2.0.92 是 25.2.0 系列最后一个带 develop 模块的版本（与本文打包的 deb 同系列）。
-base: org.deepin.base/25.2.0.92
+# ll-builder 只接受最多 3 段的依赖版本（MAJOR.MINOR[.PATCH]），4 段如 25.2.0.92 会在
+# 构建前直接报 "base version is not valid"（apps/ll-builder/src/main.cpp 的
+# Version::validateDependVersion 正则限制）。官方 Tauri demo 同样写 25.2.0，
+# 由 ll-builder 自动解析到该系列最新版本（当前为 25.2.0.94，仅含 binary 模块）。
+# 本工程不在构建容器内编译 Rust，只解 deb + 拷贝预编译二进制，因此不需要
+# base 的 develop 模块——缺失时 ll-builder 仅打印警告，不影响构建。
+base: org.deepin.base/25.2.0
 
 sources:
   # 说明：主程序 reader-desktop 与图标由 CI 的 build-binary job 编译后作为 artifact 下载到
