@@ -230,9 +230,14 @@ build: |
   export LANG=C.UTF-8
   mkdir -p "$HOME"
 
-  # ---------- 0. 编译与解包工具（gcc/pkg-config 为 Rust 链接与查找 webkit 依赖所必需） ----------
-  apt-get update || true
-  apt-get install -y --no-install-recommends zstd patchelf binutils file xz-utils curl ca-certificates gcc pkg-config make || true
+  # ---------- 0. 配置 apt 源并安装编译工具 ----------
+  # base 精简镜像可能没有配置 apt 源；gcc/pkg-config 是 Rust 链接与查找 webkit 依赖所必需，
+  # 任何一步失败都直接中断，不允许静默吞错
+  echo 'deb [trusted=yes] https://ci.deepin.com/repo/deepin/deepin-community/stable/ crimson release main community' > /etc/apt/sources.list
+  apt-get update
+  apt-get install -y --no-install-recommends gcc pkg-config make zstd patchelf binutils file xz-utils curl ca-certificates
+  command -v gcc >/dev/null || { echo "ERROR: gcc not available"; exit 1; }
+  command -v pkg-config >/dev/null || { echo "ERROR: pkg-config not available"; exit 1; }
 
   # ---------- 1. 安装 Node.js 22 ----------
   export PATH=/opt/nodejs/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
