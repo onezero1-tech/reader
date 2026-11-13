@@ -8,18 +8,19 @@ package:
   description: |
     Reader（阅读 3.0 桌面版）——本地阅读器应用，支持书源管理、书架、
     本地书籍阅读、RSS 订阅与自定义阅读界面。基于 Tauri v2 (Rust + Vue 3)。
+    主程序由 CI 预先编译（见 .github/workflows/build-linglong.yml 的 build-binary job），
+    本工程只负责把二进制与运行时依赖打包成玲珑 layer。
 
 command: [start-reader]
 
-base: org.deepin.base/25.2.0
+# 注意：不能写裸版本 25.2.0 —— ll-builder 会解析到最新的 25.2.0.94，而官方仓库里
+# .94 只有 binary 模块没有 develop 模块，构建容器会缺 apt/gcc 等全部工具。
+# 25.2.0.92 是 25.2.0 系列最后一个带 develop 模块的版本（与本文打包的 deb 同系列）。
+base: org.deepin.base/25.2.0.92
 
 sources:
-  # ---------- 项目源码（升级版本时替换 commit 即可） ----------
-  - kind: git
-    url: https://github.com/onezero1-tech/reader.git
-    version: main
-    commit: dba5d36ce3eae900f2521ad1cb81fd03b96e70e8
-    name: reader
+  # 说明：主程序 reader-desktop 与图标由 CI 的 build-binary job 编译后作为 artifact 下载到
+  # 本项目根目录（挂载进构建容器后位于 /project/），因此这里不再需要 git 源。
 
   # ---------- webkit2gtk-4.1 及其依赖（基于官方 Tauri 示例 cn.linyaps.tauri.demo） ----------
   - kind: file
@@ -222,7 +223,11 @@ sources:
 
 build: |
   set -e
-  SRC=/project/linglong/sources/reader
+
+  # 本阶段只打包，不编译：Rust/前端已在 build-binary job 用带缓存的独立 job 编译完成，
+  # 二进制与图标经 artifact 放到项目根目录，构建容器内挂在 /project 下。
+  test -f /project/reader-desktop || { echo "ERROR: /project/reader-desktop missing"; ls -la /project; exit 1; }
+  test -f /project/icons/128x128.png || { echo "ERROR: /project/icons missing"; exit 1; }
 
   # 构建容器内没有 HOME 也没有 PATH（ll-builder 1.14 只注入 PREFIX/TRIPLET 等少量变量），
   # 因此所有环境变量必须显式声明，使用固定绝对路径，绝不依赖 $HOME
@@ -230,57 +235,24 @@ build: |
   export LANG=C.UTF-8
   mkdir -p "$HOME"
 
-  # ---------- 0. 配置 apt 源并安装编译工具 ----------
-  # base 精简镜像可能没有配置 apt 源；gcc/pkg-config 是 Rust 链接与查找 webkit 依赖所必需，
-  # 任何一步失败都直接中断，不允许静默吞错
+  # ---------- 0. 配置 apt 源并安装解包工具（只打包不编译，无需 gcc） ----------
   echo 'deb [trusted=yes] https://ci.deepin.com/repo/deepin/deepin-community/stable/ crimson release main community' > /etc/apt/sources.list
   apt-get update
-  apt-get install -y --no-install-recommends gcc pkg-config make zstd patchelf binutils file xz-utils curl ca-certificates
-  command -v gcc >/dev/null || { echo "ERROR: gcc not available"; exit 1; }
-  command -v pkg-config >/dev/null || { echo "ERROR: pkg-config not available"; exit 1; }
+  apt-get install -y --no-install-recommends zstd patchelf binutils file xz-utils curl ca-certificates
+  command -v patchelf >/dev/null || { echo "ERROR: patchelf not available"; exit 1; }
 
-  # ---------- 1. 安装 Node.js 22 ----------
-  export PATH=/opt/nodejs/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
-  curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz -o /tmp/node.tar.xz
-  mkdir -p /opt/nodejs
-  tar -xJf /tmp/node.tar.xz -C /opt/nodejs --strip-components=1
-  export PATH=/opt/nodejs/bin:$PATH
-
-  # ---------- 2. 安装 Rust stable（固定到 /opt，不依赖 $HOME / rustup shim） ----------
-  export RUSTUP_HOME=/opt/rustup
-  export CARGO_HOME=/opt/cargo
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
-  export PATH=/opt/cargo/bin:$PATH
-  hash -r
-  # 安装后立即自检，避免问题拖到 tauri 阶段才以含糊的 ENOENT 报错暴露
-  command -v cargo >/dev/null || { echo "ERROR: cargo not found. PATH=$PATH"; ls -la /opt/cargo/bin 2>/dev/null || true; exit 1; }
-  cargo --version
-  rustc --version
-
-  # ---------- 3. 先把 webkit2gtk-4.1 / 托盘 / 字体依赖解压到 $PREFIX（供 pkg-config 与运行期使用） ----------
+  # ---------- 1. 把 webkit2gtk-4.1 / 托盘 / 字体依赖解压到 $PREFIX ----------
   bash ./install_dep linglong/sources $PREFIX
-  export PKG_CONFIG_PATH="$PREFIX/lib/${TRIPLET}/pkgconfig:$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig:${PKG_CONFIG_PATH:-}"
 
-  # ---------- 4. 构建 frontend ----------
-  cd "$SRC/frontend"
-  if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
-  npm run build
+  # ---------- 2. 安装主程序（预编译产物） ----------
+  install -Dm755 /project/reader-desktop $PREFIX/bin/reader
 
-  # ---------- 5. 构建 desktop（Tauri v2，不生成 bundle，直接用 cargo 产物） ----------
-  cd "$SRC/desktop"
-  if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
-  export CARGO_BUILD_JOBS=4
-  npx tauri build --no-bundle
-
-  # ---------- 6. 安装主程序 ----------
-  install -Dm755 src-tauri/target/release/reader-desktop $PREFIX/bin/reader
-
-  # ---------- 7. 修补 libwebkit2gtk-4.1.so.0 中硬编码的 WebKitNetworkProcess 路径 ----------
+  # ---------- 3. 修补 libwebkit2gtk-4.1.so.0 中硬编码的 WebKitNetworkProcess 路径 ----------
   # 用等长占位串替换，保证 ELF 内偏移不变（与官方 Tauri 示例做法一致）
   tmpdir=`mktemp -d /tmp/lib_XXXXXXXXXXXXXXXX_webkit2gtk-4.1`
   sed -i -b "s|/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1|$tmpdir|g" $PREFIX/lib/x86_64-linux-gnu/libwebkit2gtk-4.1.so.0
 
-  # ---------- 8. 启动脚本：启动时把 $PREFIX 下的 webkit2gtk-4.1 链接到占位路径 ----------
+  # ---------- 4. 启动脚本：启动时把 $PREFIX 下的 webkit2gtk-4.1 链接到占位路径 ----------
   startScript="$PREFIX/bin/start-reader"
   echo "#!/bin/sh" > $startScript
   echo "rm -r $tmpdir" >> $startScript
@@ -288,9 +260,9 @@ build: |
   echo "reader" >> $startScript
   chmod +x $startScript
 
-  # ---------- 9. 图标与桌面入口 ----------
-  install -Dm644 "$SRC/desktop/src-tauri/icons/128x128.png" $PREFIX/share/icons/hicolor/128x128/apps/com.hadc188.reader.png
-  install -Dm644 "$SRC/desktop/src-tauri/icons/icon.png" $PREFIX/share/icons/hicolor/256x256/apps/com.hadc188.reader.png
+  # ---------- 5. 图标与桌面入口 ----------
+  install -Dm644 /project/icons/128x128.png $PREFIX/share/icons/hicolor/128x128/apps/com.hadc188.reader.png
+  install -Dm644 /project/icons/icon.png $PREFIX/share/icons/hicolor/256x256/apps/com.hadc188.reader.png
   mkdir -p $PREFIX/share/applications
   cat > $PREFIX/share/applications/com.hadc188.reader.desktop <<DESKTOP_EOF
   [Desktop Entry]
