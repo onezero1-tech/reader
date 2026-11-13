@@ -30,6 +30,16 @@ total=0
 while read -r url sha; do
   [ -z "${url:-}" ] && continue
   case "$url" in \#*) continue ;; esac
+  # 防脏数据：只接受 http(s) URL 行（曾出现过文件被编辑器/传输工具
+  # 混入 "AIGC:" 等杂散行，导致 curl 报 "Port number was not a decimal number"）
+  case "$url" in
+    https://*|http://*) ;;
+    *) echo "SKIP invalid line (not a URL): $url" >&2; continue ;;
+  esac
+  if [ -z "${sha:-}" ]; then
+    echo "ERROR: line missing sha256 digest: $url" >&2
+    exit 1
+  fi
   total=$((total + 1))
   deb="$work/$(basename "$url")"
   echo "[$total] $(basename "$url")"
@@ -41,6 +51,12 @@ while read -r url sha; do
   echo "Package: $(dpkg-deb -f "$deb" Package)" >> "$out/packages.list"
 done < "$deb_list"
 echo "extracted $total debs into $out"
+# 守卫：依赖清单应为 65 个 deb（webkit2gtk + 托盘 + 字体）。少下载会导致
+# layer 缺库，宁可在这里失败也不要打出一个缺依赖的包
+if [ "$total" -ne 65 ]; then
+  echo "ERROR: expected 65 debs but only extracted $total — check debs.txt for corrupted lines" >&2
+  exit 1
+fi
 
 # ---- 以下清理/修补逻辑与官方 install_dep 保持一致 ----
 
@@ -68,7 +84,9 @@ find "$out" -type f | while IFS= read -r file; do
     *shared\ object*) ;;
     *) continue ;;
   esac
-  runpath=$(readelf -d "$file" | grep RUNPATH | awk '{print $NF}')
+  # 大多数库没有 RUNPATH，grep 无匹配会返回 1；必须 || true，
+  # 否则 set -euo pipefail 下赋值失败会直接终止脚本
+  runpath=$(readelf -d "$file" 2>/dev/null | grep RUNPATH | awk '{print $NF}' || true)
   [ -n "$runpath" ] || continue
   case "$runpath" in
     \[/*) ;;
