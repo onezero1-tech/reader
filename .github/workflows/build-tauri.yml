@@ -168,7 +168,37 @@ jobs:
           test -f icons/icon.png
           ls -lh reader-desktop icons/
 
-      # 缓存玲珑 base 层与 65 个 deb 依赖（首次约 5~10GB，命中后打包 job 只需 3~5 分钟）
+      # 缓存预解包的 deb payload（webkit/托盘/字体，约几百 MB），
+      # debs.txt 不变时直接命中，避免每次重复下载 65 个 deb
+      - name: Cache deb payload
+        id: payload_cache
+        uses: actions/cache@v4
+        with:
+          path: payload/
+          key: deb-payload-${{ hashFiles('debs.txt') }}
+
+      # 在宿主机上下载 + 校验 + 解包全部 deb 到 payload/：
+      # 25.2.0.94 的 base binary 是精简 rootfs（无 apt/binutils/zstd/patchelf），
+      # 容器内无法解包，只能提前在 runner 上做好，容器内只拷贝
+      - name: Install host extraction tools
+        if: steps.payload_cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends patchelf file curl
+
+      - name: Prepare payload (extract debs on host)
+        if: steps.payload_cache.outputs.cache-hit != 'true'
+        run: ./prepare_payload.sh debs.txt payload
+
+      - name: Verify payload
+        run: |
+          test -d payload/usr/lib/x86_64-linux-gnu
+          test -f payload/usr/lib/x86_64-linux-gnu/libwebkit2gtk-4.1.so.0
+          test -f payload/packages.list
+          du -sh payload/
+          wc -l payload/packages.list
+
+      # 缓存玲珑 base 层（首次约 5~10GB，命中后打包 job 只需 3~5 分钟）
       - name: Cache linglong builder
         uses: actions/cache@v4
         with:
