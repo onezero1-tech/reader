@@ -26,9 +26,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
+    env:
+      # ll-builder / linglong-box 在无桌面环境的 CI 上必须有可写的 XDG_RUNTIME_DIR
+      XDG_RUNTIME_DIR: /run/user/1001
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # 缓存玲珑 base 层与已下载的源码/依赖（首次构建约 5~10GB，命中后可省 15+ 分钟）
+      - name: Cache linglong builder
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/linglong-builder/
+          key: linglong-builder-cache-x86_64
+          restore-keys: linglong-builder-cache-x86_64
 
       # Tauri/Rust 构建产物很大，腾出磁盘空间（base 层 + cargo target 约 10GB+）
       - name: Free disk space
@@ -43,13 +55,18 @@ jobs:
           echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Ubuntu_24.04/ ./" \
             | sudo tee /etc/apt/sources.list.d/linglong.list
           sudo apt-get update
-          sudo apt-get install -y linglong-builder linglong-box linglong-bin
+          sudo apt-get install -y linglong-builder linglong-box linglong-bin xdg-utils
           ll-cli --version
           ll-builder --version || true
 
-      # 构建容器内会自动拉取 git 源码、Node 22、Rust 与全部 deb 依赖并编译
+      # 构建：容器内会自动拉取 git 源码、Node 22、Rust 与全部 deb 依赖并编译
       - name: Build
-        run: ll-builder build -v
+        run: |
+          sudo mkdir -p "$XDG_RUNTIME_DIR"
+          sudo chown -R 1001:1001 "$XDG_RUNTIME_DIR"
+          sudo chmod 0700 "$XDG_RUNTIME_DIR"
+          # 注意：ll-builder 1.14+ 已移除 -v/--verbose 选项
+          ll-builder build
 
       # 导出玲珑 layer 安装包（binary + develop）
       - name: Export layer
