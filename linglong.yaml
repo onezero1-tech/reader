@@ -251,7 +251,7 @@ build: |
   cd "$SRC/desktop"
   if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
   export CARGO_BUILD_JOBS=4
-  npx tauri build --bundles none
+  npx tauri build --no-bundle
 
   # ---------- 6. 安装主程序 ----------
   install -Dm755 src-tauri/target/release/reader-desktop $PREFIX/bin/reader
