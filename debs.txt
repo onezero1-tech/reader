@@ -63,3 +63,9 @@ https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/a/ayatana-id
 https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libd/libdbusmenu/libdbusmenu-gtk3-4_18.10.20180917~bzr492+repack1-deepin1_amd64.deb  3eed21075d074284272fa913011f47d48e2b136e3e9a9b7aaf38450312d93bc1
 https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libd/libdbusmenu/libdbusmenu-glib4_18.10.20180917~bzr492+repack1-deepin1_amd64.deb  5cc2ae8f9032e247d6648ead0a8328233d34ed51ce5e472255611fc0e9e801de
 https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/f/fonts-noto-cjk/fonts-noto-cjk_20240730+repack1-1_all.deb  7171f1f8b656d6aac907cfe296faafc87522d5a63d355f4099cc6ee467986597
+https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/liba/libavif/libavif15_0.11.1-3_amd64.deb  572845eabad9ceadcfd1923b940e4c56d4b9cc0636134774cd3a2dd9a1c35701
+https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/a/aom/libaom3_3.12.1-1_amd64.deb  7acabcf052ba5d5af6037d8823087961450ba38db9be19602fe97d3f60baa68b
+https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/d/dav1d/libdav1d6_1.2.1-2deepin1_amd64.deb  258bd4678ba2f0f0a63f00e630c890efb34a1adf65e1017308e28a16ddd25eb5
+https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/s/svt-av1/libsvtav1enc1d1_1.7.0%2Bdfsg-2_amd64.deb  fbdb57f1b3b245ef8d92d7a29bd0b054fec010ffd245b1d633172674acbdd7cd
+https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/r/rust-rav1e/librav1e0_0.6.6-3_amd64.deb  59a08ca19c702ae237a780f353ca83fe082a117b7fa4d2fa3678c32e2459c594
+https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libw/libwebp/libsharpyuv0_1.5.0-0.1_amd64.deb  4a1a754df14aa7843c4d3589470571faecd39197588c4ca36fe2bee103a845e2
