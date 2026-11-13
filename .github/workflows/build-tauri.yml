@@ -63,11 +63,13 @@ jobs:
       - name: Setup Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      # Rust 增量编译缓存：命中后 cargo 编译从 30 分钟降到 5 分钟左右
+      # Rust 增量编译缓存：命中后 cargo 编译从 30 分钟降到 5 分钟左右。
+      # reader 仓库根就是 cargo workspace（Cargo.lock 与 target/ 都在仓库根），
+      # 因此缓存路径必须填仓库根，而不是 desktop/src-tauri。
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: desktop/src-tauri
+          workspaces: .
 
       - name: Build frontend (Vue 3)
         run: |
@@ -81,12 +83,23 @@ jobs:
           npm ci --no-audit --no-fund
           npx tauri build --no-bundle
 
+      # tauri build 在 desktop/ 下执行，但 cargo workspace 根在仓库根，
+      # 产物实际位于 <repo-root>/target/release/reader-desktop。
+      # 这里自动定位，避免路径再次写错。
       - name: Stage artifacts
         run: |
+          BIN=$(find "$GITHUB_WORKSPACE" -type f -name reader-desktop -path '*/release/*' -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "ERROR: reader-desktop binary not found under target/release/"
+            find "$GITHUB_WORKSPACE" -name 'reader-desktop*' -not -path '*/node_modules/*' || true
+            exit 1
+          fi
+          echo "Found binary: $BIN"
           mkdir -p stage/icons
-          cp -v desktop/src-tauri/target/release/reader-desktop stage/
+          cp -v "$BIN" stage/reader-desktop
           cp -v desktop/src-tauri/icons/128x128.png stage/icons/
           cp -v desktop/src-tauri/icons/icon.png stage/icons/
+          file stage/reader-desktop
           ls -lhR stage/
 
       - name: Upload binary artifact
