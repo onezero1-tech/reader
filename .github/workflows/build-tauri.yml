@@ -188,7 +188,8 @@ jobs:
 
       - name: Prepare payload (extract debs on host)
         if: steps.payload_cache.outputs.cache-hit != 'true'
-        run: ./prepare_payload.sh debs.txt payload
+        # 用 bash 显式调用，避免 git 丢失可执行位导致 Permission denied
+        run: bash prepare_payload.sh debs.txt payload
 
       - name: Verify payload
         run: |
