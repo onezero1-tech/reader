@@ -44,7 +44,30 @@ jobs:
           repository: ${{ env.READER_REPO }}
           ref: ${{ env.READER_REF }}
 
+      # GitHub Actions 每次运行都是全新环境，上一次运行成功的编译产物不会自动复用。
+      # 这里以 READER_REF（锁定的 reader commit）为 key 缓存最终二进制：
+      # 只有 linglong.yaml / install_dep 改动而 READER_REF 不变时，本 job 直接命中缓存、
+      # 跳过全部编译步骤（约 1 分钟）；READER_REF 变了才重新编译并刷新缓存。
+      # 注意：GitHub 缓存 7 天未被访问会被自动回收，届时会重新全量编译一次。
+      - name: Restore prebuilt binary cache
+        id: binary_cache
+        uses: actions/cache@v4
+        with:
+          path: stage/
+          key: reader-desktop-binary-${{ env.READER_REF }}
+
+      - name: Skip compile on cache hit
+        if: steps.binary_cache.outputs.cache-hit == 'true'
+        run: |
+          echo "Cache hit for READER_REF=${READER_REF}, skip compiling"
+          test -f stage/reader-desktop
+          test -f stage/icons/128x128.png
+          test -f stage/icons/icon.png
+          file stage/reader-desktop
+          ls -lhR stage/
+
       - name: Setup Node.js 22
+        if: steps.binary_cache.outputs.cache-hit != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -55,29 +78,34 @@ jobs:
 
       # 链接期只需要 -dev 头文件与 .so，运行期由玲珑 layer 自带 deepin 版 webkit/托盘库
       - name: Install link-time dependencies
+        if: steps.binary_cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev pkg-config file
 
       - name: Setup Rust stable
+        if: steps.binary_cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       # Rust 增量编译缓存：命中后 cargo 编译从 30 分钟降到 5 分钟左右。
       # reader 仓库根就是 cargo workspace（Cargo.lock 与 target/ 都在仓库根），
       # 因此缓存路径必须填仓库根，而不是 desktop/src-tauri。
       - name: Rust cache
+        if: steps.binary_cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: .
 
       - name: Build frontend (Vue 3)
+        if: steps.binary_cache.outputs.cache-hit != 'true'
         run: |
           cd frontend
           npm ci --no-audit --no-fund
           npm run build
 
       - name: Build desktop (Tauri v2, no bundle)
+        if: steps.binary_cache.outputs.cache-hit != 'true'
         run: |
           cd desktop
           npm ci --no-audit --no-fund
@@ -87,6 +115,7 @@ jobs:
       # 产物实际位于 <repo-root>/target/release/reader-desktop。
       # 这里自动定位，避免路径再次写错。
       - name: Stage artifacts
+        if: steps.binary_cache.outputs.cache-hit != 'true'
         run: |
           BIN=$(find "$GITHUB_WORKSPACE" -type f -name reader-desktop -path '*/release/*' -print -quit)
           if [ -z "$BIN" ]; then
