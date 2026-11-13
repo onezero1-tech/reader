@@ -224,19 +224,33 @@ build: |
   set -e
   SRC=/project/linglong/sources/reader
 
-  # ---------- 0. install_dep 所需的小工具（容器内尽力安装，失败不影响构建） ----------
+  # 构建容器内没有 HOME 也没有 PATH（ll-builder 1.14 只注入 PREFIX/TRIPLET 等少量变量），
+  # 因此所有环境变量必须显式声明，使用固定绝对路径，绝不依赖 $HOME
+  export HOME=/opt/buildhome
+  export LANG=C.UTF-8
+  mkdir -p "$HOME"
+
+  # ---------- 0. 编译与解包工具（gcc/pkg-config 为 Rust 链接与查找 webkit 依赖所必需） ----------
   apt-get update || true
-  apt-get install -y --no-install-recommends zstd patchelf binutils file xz-utils curl ca-certificates || true
+  apt-get install -y --no-install-recommends zstd patchelf binutils file xz-utils curl ca-certificates gcc pkg-config make || true
 
   # ---------- 1. 安装 Node.js 22 ----------
+  export PATH=/opt/nodejs/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
   curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz -o /tmp/node.tar.xz
   mkdir -p /opt/nodejs
   tar -xJf /tmp/node.tar.xz -C /opt/nodejs --strip-components=1
   export PATH=/opt/nodejs/bin:$PATH
 
-  # ---------- 2. 安装 Rust stable ----------
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-  export PATH="$HOME/.cargo/bin:$PATH"
+  # ---------- 2. 安装 Rust stable（固定到 /opt，不依赖 $HOME / rustup shim） ----------
+  export RUSTUP_HOME=/opt/rustup
+  export CARGO_HOME=/opt/cargo
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+  export PATH=/opt/cargo/bin:$PATH
+  hash -r
+  # 安装后立即自检，避免问题拖到 tauri 阶段才以含糊的 ENOENT 报错暴露
+  command -v cargo >/dev/null || { echo "ERROR: cargo not found. PATH=$PATH"; ls -la /opt/cargo/bin 2>/dev/null || true; exit 1; }
+  cargo --version
+  rustc --version
 
   # ---------- 3. 先把 webkit2gtk-4.1 / 托盘 / 字体依赖解压到 $PREFIX（供 pkg-config 与运行期使用） ----------
   bash ./install_dep linglong/sources $PREFIX
@@ -286,4 +300,3 @@ build: |
   Categories=Network;Utility;Literature;
   StartupNotify=true
   DESKTOP_EOF
-
