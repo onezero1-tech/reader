@@ -1,12 +1,31 @@
 # Reader 玲珑包 CI —— 双 job 流水线（编译 + 打包，缓存互相独立）
 #
+# 打包路线：ll-killer（社区构建工具，verge-rev 同款）
+#   1. ll-killer layer build  不做任何依赖拉取，直接在 runner 的 user/mount/pid
+#      namespace 中执行 linglong.yaml 的 build 脚本，产物直接打包成 *_binary.layer；
+#   2. ll-builder import      把 layer 导入本地构建仓库；
+#   3. ll-builder export -z zstd  从本地仓库导出 UAB（仅 binary 模块，无 develop）。
+#
+# 为什么必须走 ll-killer：org.deepin.runtime.gtk4 只发布在社区测试源
+# （cdn-linglong.odata.cc），官方镜像 mirror-repo-linglong.deepin.com 上没有该 ref
+# （已实测：官方 15716 个 ref 中 0 个 runtime.gtk4）。ll-builder build 的
+# "stage pull dependency" 阶段按优先级逐仓检索依赖，官方源查不到且无备用源时
+# 直接失败（exit 255）；而 `ll-builder repo` 子命令在 1.14 走 DBus 包管理器，
+# CI runner 上没有 linglong 守护进程，无法用命令行添加社区源。
+# ll-killer 构建期完全不解析/拉取 base 和 runtime，从根上绕开该问题。
+#
+# 安装侧前提（见 README 说明）：终端用户安装本包时 ll-cli 仍需解析
+# org.deepin.runtime.gtk4/25.2.2，需先添加社区测试源：
+#   ll-cli repo add community https://cdn-linglong.odata.cc
+#
 # 代码更新后的操作说明：
 #   情况 A（发布固定版本）：把 env.READER_REF 改成目标 commit 的完整 sha
 #   情况 B（跟踪分支最新提交）：env.READER_REF 填分支名（main/master）。
 #       缓存 key 已包含实际源码 commit sha（SOURCE_SHA），每个提交自动
 #       重新编译；同一次构建重跑（re-run）仍命中缓存。无需手动清缓存。
 #   情况 C（版本变更）：只改下方 APP_VERSION 一处，会自动注入 linglong.yaml
-#       的 package.version（注意保持 1.6.5.0 这种纯数字格式）。
+#       的 package.version（注意保持 1.6.6.0 这种 4 段纯数字格式，ll-killer
+#       要求 package.version 必须是 MAJOR.MINOR.PATCH.TWEAK 四段）。
 #   依赖层 debs.txt 只含 5 个托盘 deb（其余依赖由 org.deepin.runtime.gtk4
 #   提供），payload 缓存不变时永远命中——代码更新只重跑编译 job。
 
@@ -126,7 +145,7 @@ jobs:
           path: stage/
           retention-days: 7
 
-  # ================= job 2: 打玲珑包（复用 payload 缓存，不编译代码） =================
+  # ================= job 2: 打玲珑包（ll-killer 路线，不编译代码） =================
   package-linglong:
     needs: build-binary
     runs-on: ubuntu-24.04
@@ -135,11 +154,11 @@ jobs:
       # 关键：这里 checkout 默认 ref（触发本次 CI 的提交），保证拿到最新的
       # linglong.yaml / debs.txt / prepare_payload.sh。
       # 不要改成 READER_REF——那是给源码编译用的；指向旧 commit 会因缺少
-      # linglong.yaml 报 "the project file is not found"。
+      # linglong.yaml 报错。
       - name: Checkout packaging project
         uses: actions/checkout@v4
 
-      # 显式守卫：工程文件缺失时立刻报错并列出目录，不再等到 ll-builder 才失败
+      # 显式守卫：工程文件缺失时立刻报错并列出目录
       - name: Guard packaging files present
         run: |
           pwd
@@ -161,6 +180,8 @@ jobs:
           sudo chown -R 1001:1001 "$XDG_RUNTIME_DIR"
           sudo chmod 0700 "$XDG_RUNTIME_DIR"
 
+      # linglong-builder 提供 ll-builder（import/export 用），
+      # erofs-utils 提供 mkfs.erofs（ll-killer layer build 打包用）
       - name: Install linglong toolchain
         run: |
           # 官方 apt 源在 ci.deepin.com 的 OBS 镜像上（注意目录名是 Ubuntu_24.04，
@@ -168,8 +189,22 @@ jobs:
           echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Ubuntu_24.04/ ./" \
             | sudo tee /etc/apt/sources.list.d/linyaps.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y linglong-builder linglong-box linglong-bin
+          sudo apt-get install -y linglong-builder linglong-box linglong-bin erofs-utils
           ll-builder --version
+
+      # ll-killer：社区构建工具，layer build 模式不需要任何 linglong 仓库
+      # （构建期不拉 base/runtime，宿主 rootfs + /project 直接构建并 erofs 打包）
+      - name: Install ll-killer
+        run: |
+          set -e
+          curl -fsSL --retry 3 --connect-timeout 30 -o ll-killer \
+            https://github.com/System233/ll-killer-go/releases/latest/download/ll-killer-amd64 \
+          || curl -fsSL --retry 3 --connect-timeout 30 -o ll-killer \
+            https://ll-killer.win/releases/latest/download/ll-killer-amd64
+          chmod +x ll-killer
+          sudo mv ll-killer /usr/local/bin/ll-killer
+          command -v ll-killer
+          ll-killer --help | head -5
 
       - name: Download staged binary
         uses: actions/download-artifact@v4
@@ -212,11 +247,6 @@ jobs:
 
       - name: Verify payload
         run: |
-          echo "== payload/ top-level =="
-          ls -la payload/ 2>/dev/null || echo "(payload/ not found)"
-          echo "== payload/usr/lib/x86_64-linux-gnu =="
-          ls payload/usr/lib/x86_64-linux-gnu/ 2>/dev/null | head -10 || true
-          # deepin 的 deb 是 usr-merged 布局：库文件在 usr/lib 下
           test -d payload/usr/lib/x86_64-linux-gnu \
             || { echo "FAIL: payload/usr/lib/x86_64-linux-gnu missing"; exit 1; }
           test -f payload/usr/lib/x86_64-linux-gnu/libayatana-appindicator3.so.1 \
@@ -234,20 +264,36 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/linglong-builder/
+          # 缓存 ll-builder import 的 layer 与 export 时拉取的
+          # cn.org.linyaps.builder.utils（官方源），加速导出
           key: linglong-builder-cache-x86_64
 
-      - name: ll-builder build
-        run: ll-builder build
-
-      - name: ll-builder export (UAB)
+      # 不做任何依赖拉取：layer build 在命名空间里用宿主 rootfs 执行
+      # linglong.yaml 的 build 脚本（纯拷贝二进制/托盘库/图标），产物直接
+      # erofs 打包为 com.hadc188.reader_${APP_VERSION}_x86_64_binary.layer
+      - name: ll-killer layer build
         run: |
-          # linglong-builder >= 1.6 的 export 不再接受位置参数（文件名），
-          # 传文件名会报 "The following argument was not expected" (exit 109)。
-          # 默认导出 UAB 格式（推荐），输出文件名自动生成：
-          #   com.hadc188.reader_${APP_VERSION}_x86_64.uab
-          # UAB 默认只导出 binary 模块（exportUAB 中 modules 为空时默认 binary），
-          # 不会生成 develop 文件；--no-develop 仅对 --layer 模式有效，UAB 不需要。
-          # -z zstd：UAB 默认 lz4 压缩率低，zstd 明显更小（约再省 20-30%）
+          ll-killer layer build --no-post-setup
+          echo "== layer output =="
+          ls -la *.layer || true
+          layer_count=$(ls *_binary.layer 2>/dev/null | wc -l)
+          [ "$layer_count" -eq 1 ] || {
+            echo "FAIL: expected exactly 1 *_binary.layer, got $layer_count"
+            find . -maxdepth 3 -name '*.layer' -o -maxdepth 3 -name '*.uab' 2>/dev/null || true
+            exit 1
+          }
+
+      # 导入本地仓库后导出 UAB：
+      #   import 注册 layer 到 ~/.cache/linglong-builder（本地仓库，无需 DBus/守护进程）
+      #   export 默认导出 UAB 且只含 binary 模块（无 develop）；
+      #   -z zstd：UAB 默认 lz4 压缩率低，zstd 明显更小
+      #   export 时会按需从官方源拉取 cn.org.linyaps.builder.utils 工具包
+      - name: Import layer & export UAB
+        run: |
+          set -e
+          layer_file=$(ls *_binary.layer | head -1)
+          echo "importing: $layer_file"
+          ll-builder import "$layer_file"
           ll-builder export -z zstd
           echo "== exported uab files =="
           ls -la com.hadc188.reader_*.uab
@@ -260,6 +306,14 @@ jobs:
           name: reader-linglong-uab
           path: com.hadc188.reader_*.uab
           retention-days: 30
+
+      # layer 仅作调试用途（UAB 已含应用层）
+      - name: Upload layer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader-linglong-layer
+          path: com.hadc188.reader_*_binary.layer
+          retention-days: 7
 
       # 打 tag 时自动把 uab 挂到 GitHub Release
       - name: Release uab
