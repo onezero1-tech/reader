@@ -7,7 +7,8 @@
 #       重新编译；同一次构建重跑（re-run）仍命中缓存。无需手动清缓存。
 #   情况 C（版本变更）：只改下方 APP_VERSION 一处，会自动注入 linglong.yaml
 #       的 package.version（注意保持 1.6.5.0 这种纯数字格式）。
-#   依赖层 debs.txt 不变时，payload 缓存永远命中——代码更新只重跑编译 job。
+#   依赖层 debs.txt 只含 5 个托盘 deb（其余依赖由 org.deepin.runtime.gtk4
+#   提供），payload 缓存不变时永远命中——代码更新只重跑编译 job。
 
 name: Build Linglong Package
 
@@ -184,27 +185,25 @@ jobs:
           cp staged/icons/icon.png    icons/icon.png
           ls -la reader-desktop icons/
 
-      - name: Restore deb payload
+      - name: Restore tray payload
         id: payload-cache
         uses: actions/cache@v4
         with:
           path: payload/
-          # 只由 debs.txt 内容决定——代码更新不影响此缓存
-          key: deb-payload-${{ hashFiles('debs.txt') }}
+          # 迁移到 org.deepin.runtime.gtk4 后 payload 只剩 5 个托盘 deb，
+          # key 中的 v2 前缀避免命中旧的 71-deb 大缓存
+          key: tray-payload-v2-${{ hashFiles('debs.txt') }}
 
       - name: Install payload tools
         run: sudo apt-get install -y patchelf file curl
 
-      - name: Prepare payload (download & unpack debs)
+      - name: Prepare payload (download & unpack tray debs)
         run: |
           # 以磁盘上的实际完整性为准，而不是缓存命中标记：
           # 缓存命中但恢复内容不完整时自动重新下载解包，避免静默缺文件
           # 注意：deepin 的 deb 是 usr-merged 布局，库在 payload/usr/lib/，
           # 不是 payload/lib/（后者只是部分 deb 带来的空目录）
-          # TRIM_UAB=1（默认）裁剪 doc/词典/冗余字体等，KEEP_CJK_FONTS=0 可
-          # 再省 90MB 的 Noto CJK 字体（需确认 base 已含 CJK 字体）
-          if [ -f payload/usr/lib/x86_64-linux-gnu/libwebkit2gtk-4.1.so.0 ] \
-             && [ -d payload/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1 ] \
+          if [ -f payload/usr/lib/x86_64-linux-gnu/libayatana-appindicator3.so.1 ] \
              && [ -f payload/packages.list ]; then
             echo "payload already complete (from cache), skip download"
             exit 0
@@ -215,21 +214,21 @@ jobs:
         run: |
           echo "== payload/ top-level =="
           ls -la payload/ 2>/dev/null || echo "(payload/ not found)"
-          echo "== payload/usr/lib/x86_64-linux-gnu (first 5) =="
-          ls payload/usr/lib/x86_64-linux-gnu/ 2>/dev/null | head -5 || true
+          echo "== payload/usr/lib/x86_64-linux-gnu =="
+          ls payload/usr/lib/x86_64-linux-gnu/ 2>/dev/null | head -10 || true
           # deepin 的 deb 是 usr-merged 布局：库文件在 usr/lib 下
           test -d payload/usr/lib/x86_64-linux-gnu \
             || { echo "FAIL: payload/usr/lib/x86_64-linux-gnu missing"; exit 1; }
-          test -f payload/usr/lib/x86_64-linux-gnu/libwebkit2gtk-4.1.so.0 \
-            || { echo "FAIL: libwebkit2gtk-4.1.so.0 missing (debs.txt 缺少 webkit2gtk 相关条目?)"; exit 1; }
-          test -d payload/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1 \
-            || { echo "FAIL: webkit2gtk-4.1/ dir missing (linglong.yaml 修补 WebKitNetworkProcess 路径需要它)"; exit 1; }
+          test -f payload/usr/lib/x86_64-linux-gnu/libayatana-appindicator3.so.1 \
+            || { echo "FAIL: libayatana-appindicator3.so.1 missing (tauri tray-icon 依赖)"; exit 1; }
+          test -f payload/usr/lib/x86_64-linux-gnu/libdbusmenu-gtk3.so.4 \
+            || { echo "FAIL: libdbusmenu-gtk3.so.4 missing"; exit 1; }
           test -f payload/packages.list \
             || { echo "FAIL: packages.list missing"; exit 1; }
           du -sh payload
           count=$(wc -l < payload/packages.list)
           echo "packages.list lines: $count"
-          [ "$count" -eq 71 ] || { echo "FAIL: packages.list 应为 71 个包，实际 $count"; exit 1; }
+          [ "$count" -eq 5 ] || { echo "FAIL: packages.list 应为 5 个托盘包，实际 $count"; exit 1; }
 
       - name: Restore ll-builder cache
         uses: actions/cache@v4
