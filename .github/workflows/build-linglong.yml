@@ -1,10 +1,14 @@
 # Reader 玲珑包 CI —— 双 job 流水线（编译 + 打包，缓存互相独立）
 #
-# 打包路线：ll-killer（社区构建工具，verge-rev 同款）
-#   1. ll-killer layer build  不做任何依赖拉取，直接在 runner 的 user/mount/pid
-#      namespace 中执行 linglong.yaml 的 build 脚本，产物直接打包成 *_binary.layer；
-#   2. ll-builder import      把 layer 导入本地构建仓库；
-#   3. ll-builder export -z zstd  从本地仓库导出 UAB（仅 binary 模块，无 develop）。
+# 打包路线：ll-killer（社区构建工具，verge-rev 同款），交付物为 *.layer
+#   ll-killer layer build  不做任何依赖拉取，直接在 runner 的 user/mount/pid
+#   namespace 中执行 linglong.yaml 的 build 脚本，产物 *_binary.layer 即最终
+#   交付物（verge-rev 同款，直接发布 layer、不导出 UAB）。
+#
+#   为什么不导出 UAB：实测 ll-builder export 生成的 UAB 在 linglong 1.10.6
+#   客户端上安装失败（解析 layers/<app>/binary/info.json 时报
+#   "load json from file ... read all: 不支持的操作"，新旧构建器 UAB 格式
+#   不兼容）；而 layer 文件安装、运行均正常，故与 verge-rev 保持一致只发 layer。
 #
 # 为什么必须走 ll-killer：org.deepin.runtime.gtk4 只发布在社区测试源
 # （cdn-linglong.odata.cc），官方镜像 mirror-repo-linglong.deepin.com 上没有该 ref
@@ -14,9 +18,10 @@
 # CI runner 上没有 linglong 守护进程，无法用命令行添加社区源。
 # ll-killer 构建期完全不解析/拉取 base 和 runtime，从根上绕开该问题。
 #
-# 安装侧前提（见 README 说明）：终端用户安装本包时 ll-cli 仍需解析
-# org.deepin.runtime.gtk4/25.2.2，需先添加社区测试源：
+# 安装侧前提：终端用户安装本包时 ll-cli 仍需解析 org.deepin.runtime.gtk4/25.2.2
+# （该 runtime 仅存在于社区测试源），需先添加社区测试源再安装：
 #   ll-cli repo add community https://cdn-linglong.odata.cc
+#   ll-cli install com.hadc188.reader_1.6.6.0_x86_64_binary.layer
 #
 # 代码更新后的操作说明：
 #   情况 A（发布固定版本）：把 env.READER_REF 改成目标 commit 的完整 sha
@@ -180,8 +185,9 @@ jobs:
           sudo chown -R 1001:1001 "$XDG_RUNTIME_DIR"
           sudo chmod 0700 "$XDG_RUNTIME_DIR"
 
-      # linglong-builder 提供 ll-builder（import/export 用），
-      # erofs-utils 提供 mkfs.erofs（ll-killer layer build 打包用）
+      # 工具链与 verge-rev 保持一致：linglong-box（ll-box，ll-killer 的运行环境）、
+      # erofs-utils（mkfs.erofs，layer 打包用）、fuse-overlayfs（构建命名空间 overlay）。
+      # 不再装 linglong-builder/linglong-bin——那是 import/export UAB 用的，现已移除。
       - name: Install linglong toolchain
         run: |
           # 官方 apt 源在 ci.deepin.com 的 OBS 镜像上（注意目录名是 Ubuntu_24.04，
@@ -189,8 +195,8 @@ jobs:
           echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Ubuntu_24.04/ ./" \
             | sudo tee /etc/apt/sources.list.d/linyaps.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y linglong-builder linglong-box linglong-bin erofs-utils
-          ll-builder --version
+          sudo apt-get install -y linglong-box erofs-utils fuse-overlayfs
+          ll-box --version || true
 
       # ll-killer：社区构建工具，layer build 模式不需要任何 linglong 仓库
       # （构建期不拉 base/runtime，宿主 rootfs + /project 直接构建并 erofs 打包）
@@ -260,14 +266,6 @@ jobs:
           echo "packages.list lines: $count"
           [ "$count" -eq 5 ] || { echo "FAIL: packages.list 应为 5 个托盘包，实际 $count"; exit 1; }
 
-      - name: Restore ll-builder cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/linglong-builder/
-          # 缓存 ll-builder import 的 layer 与 export 时拉取的
-          # cn.org.linyaps.builder.utils（官方源），加速导出
-          key: linglong-builder-cache-x86_64
-
       # 不做任何依赖拉取：layer build 在命名空间里用宿主 rootfs 执行
       # linglong.yaml 的 build 脚本（纯拷贝二进制/托盘库/图标），产物直接
       # erofs 打包为 com.hadc188.reader_${APP_VERSION}_x86_64_binary.layer
@@ -283,41 +281,18 @@ jobs:
             exit 1
           }
 
-      # 导入本地仓库后导出 UAB：
-      #   import 注册 layer 到 ~/.cache/linglong-builder（本地仓库，无需 DBus/守护进程）
-      #   export 默认导出 UAB 且只含 binary 模块（无 develop）；
-      #   -z zstd：UAB 默认 lz4 压缩率低，zstd 明显更小
-      #   export 时会按需从官方源拉取 cn.org.linyaps.builder.utils 工具包
-      - name: Import layer & export UAB
-        run: |
-          set -e
-          layer_file=$(ls *_binary.layer | head -1)
-          echo "importing: $layer_file"
-          ll-builder import "$layer_file"
-          ll-builder export -z zstd
-          echo "== exported uab files =="
-          ls -la com.hadc188.reader_*.uab
-          uab_count=$(ls com.hadc188.reader_*.uab 2>/dev/null | wc -l)
-          [ "$uab_count" -ge 1 ] || { echo "FAIL: no .uab file generated"; exit 1; }
-
-      - name: Upload uab artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: reader-linglong-uab
-          path: com.hadc188.reader_*.uab
-          retention-days: 30
-
-      # layer 仅作调试用途（UAB 已含应用层）
+      # layer 即最终交付物：不再 import/export UAB
+      # （实测 1.14 导出的 UAB 在 linglong 1.10.6 客户端安装失败，layer 安装运行正常）
       - name: Upload layer artifact
         uses: actions/upload-artifact@v4
         with:
           name: reader-linglong-layer
           path: com.hadc188.reader_*_binary.layer
-          retention-days: 7
+          retention-days: 30
 
-      # 打 tag 时自动把 uab 挂到 GitHub Release
-      - name: Release uab
+      # 打 tag 时自动把 layer 挂到 GitHub Release
+      - name: Release layer
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: com.hadc188.reader_*.uab
+          files: com.hadc188.reader_*_binary.layer
