@@ -49,13 +49,19 @@ on:
 env:
   READER_REPO: onezero1-tech/reader
   # 情况 A：写死 commit sha；情况 B：改成 main / master 跟踪分支
-  READER_REF: main
+  READER_REF: dba5d36ce3eae900f2521ad1cb81fd03b96e70e8
   # 情况 C：发新版本时只改这里（会被 sed 注入 linglong.yaml 的 package.version）
   APP_VERSION: 1.6.6.0
   XDG_RUNTIME_DIR: /run/user/1001
 
 jobs:
   # ================= job 1: 编译 reader-desktop（与玲珑无关，独立缓存） =================
+  # 关键约束：玲珑 base（deepin 23/25）的 glibc 是 2.38，而 Ubuntu 24.04 runner
+  # 的 glibc 是 2.39——直接在 runner 上编译的产物会引用 GLIBC_2.39，运行时报
+  #   weak version `GLIBC_2.39' not found (required by reader)
+  # 这是弱引用警告，启动不会挂，但一旦真正调到 2.39 才有的符号就直接段错误，
+  # 所以必须把目标 glibc 压到 ≤2.38（这里选 2.35 留余量，兼容 UOS/麒麟老环境）。
+  # 做法：cargo-zigbuild（zig 作为链接器，指定 glibc 目标版本）。
   build-binary:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -77,7 +83,9 @@ jobs:
         with:
           path: stage/
           # 注意：不要加 restore-keys，否则新代码会回退到旧二进制
-          key: reader-desktop-binary-${{ env.SOURCE_SHA }}
+          # v2 前缀：换 cargo-zigbuild（glibc 2.35）编译后强制丢弃旧 key 下的
+          # glibc 2.39 产物，防止命中旧缓存导致 GLIBC 警告复现
+          key: reader-desktop-binary-v2-${{ env.SOURCE_SHA }}
 
       - name: Validate staged files
         id: staged
@@ -113,6 +121,20 @@ jobs:
           # cargo workspace 根在仓库根（Cargo.lock / target/ 都在根目录）
           workspaces: .
 
+      # cargo-zigbuild：pip 安装时自动带上配套的 ziglang（版本兼容由 PyPI
+      # 依赖关系钉死，无需手动选 zig 版本）。装在独立 venv 里绕开 Ubuntu 24.04
+      # 的 PEP 668（externally-managed-environment）限制。
+      - name: Install cargo-zigbuild
+        if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
+        run: |
+          python3 -m venv /tmp/zigbuild-venv
+          /tmp/zigbuild-venv/bin/pip install --upgrade pip
+          /tmp/zigbuild-venv/bin/pip install cargo-zigbuild
+          echo "/tmp/zigbuild-venv/bin" >> "$GITHUB_PATH"
+          # ziglang 装在 venv 内，系统 python3 看不到；显式告诉 zigbuild 用哪个 python
+          echo "CARGO_ZIGBUILD_PYTHON_PATH=/tmp/zigbuild-venv/bin/python" >> "$GITHUB_ENV"
+          /tmp/zigbuild-venv/bin/cargo-zigbuild zigbuild --help >/dev/null && echo "cargo-zigbuild OK"
+
       - name: Build frontend
         if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
         working-directory: frontend
@@ -120,12 +142,18 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build desktop (tauri --no-bundle)
+      # 用 cargo zigbuild 代替 npx tauri build：
+      #   - tauri CLI 对 cargo 的封装不影响产物（frontendDist 已由上一步构建好，
+      #     custom-protocol feature 编译期内嵌资源，beforeBuildCommand 只是 echo）
+      #   - zigbuild 指定 glibc 2.35 目标，消除 GLIBC_2.39 引用（见 job 顶部说明）
+      #   - CFLAGS=-isystem /usr/include：让 zig cc 对非 glibc 头文件（gtk/webkit
+      #     开发头在 /usr/include 子目录）回退到系统头文件路径
+      - name: Build desktop (cargo zigbuild, glibc 2.35)
         if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
-        working-directory: desktop
+        env:
+          CFLAGS: -isystem /usr/include
         run: |
-          npm ci
-          npx tauri build --no-bundle
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.35 -p reader-desktop
 
       - name: Stage artifacts
         if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
@@ -142,6 +170,19 @@ jobs:
           install -Dm755 "$bin" stage/reader-desktop
           cp desktop/src-tauri/icons/128x128.png stage/icons/128x128.png
           cp desktop/src-tauri/icons/icon.png     stage/icons/icon.png
+
+      # 硬校验：产物的最高 GLIBC 符号版本不得超过 2.35（cache 命中时也会执行）
+      - name: Verify glibc compatibility
+        run: |
+          test -f stage/reader-desktop || { echo "stage/reader-desktop missing"; exit 1; }
+          maxver=$(objdump -T stage/reader-desktop \
+            | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1 | cut -d_ -f2)
+          echo "max GLIBC symbol version: $maxver"
+          if [ "$(printf '%s\n' 2.35 "$maxver" | sort -V | tail -1)" != "2.35" ]; then
+            echo "FAIL: 二进制需要 GLIBC $maxver，超过目标 2.35（deepin 25 只有 2.38，老系统更低）"
+            objdump -T stage/reader-desktop | grep -E 'GLIBC_2\.(3[6-9]|[4-9][0-9])' | head -20
+            exit 1
+          fi
 
       - name: Upload staged binary
         uses: actions/upload-artifact@v4
