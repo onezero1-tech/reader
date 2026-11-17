@@ -201,6 +201,8 @@ jobs:
           # 缓存命中但恢复内容不完整时自动重新下载解包，避免静默缺文件
           # 注意：deepin 的 deb 是 usr-merged 布局，库在 payload/usr/lib/，
           # 不是 payload/lib/（后者只是部分 deb 带来的空目录）
+          # TRIM_UAB=1（默认）裁剪 doc/词典/冗余字体等，KEEP_CJK_FONTS=0 可
+          # 再省 90MB 的 Noto CJK 字体（需确认 base 已含 CJK 字体）
           if [ -f payload/usr/lib/x86_64-linux-gnu/libwebkit2gtk-4.1.so.0 ] \
              && [ -d payload/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1 ] \
              && [ -f payload/packages.list ]; then
@@ -246,7 +248,8 @@ jobs:
           #   com.hadc188.reader_${APP_VERSION}_x86_64.uab
           # UAB 默认只导出 binary 模块（exportUAB 中 modules 为空时默认 binary），
           # 不会生成 develop 文件；--no-develop 仅对 --layer 模式有效，UAB 不需要。
-          ll-builder export
+          # -z zstd：UAB 默认 lz4 压缩率低，zstd 明显更小（约再省 20-30%）
+          ll-builder export -z zstd
           echo "== exported uab files =="
           ls -la com.hadc188.reader_*.uab
           uab_count=$(ls com.hadc188.reader_*.uab 2>/dev/null | wc -l)
