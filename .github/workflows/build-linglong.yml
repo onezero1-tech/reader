@@ -49,7 +49,7 @@ on:
 env:
   READER_REPO: onezero1-tech/reader
   # 情况 A：写死 commit sha；情况 B：改成 main / master 跟踪分支
-  READER_REF: main
+  READER_REF: dba5d36ce3eae900f2521ad1cb81fd03b96e70e8
   # 情况 C：发新版本时只改这里（会被 sed 注入 linglong.yaml 的 package.version）
   APP_VERSION: 1.6.6.0
   XDG_RUNTIME_DIR: /run/user/1001
@@ -252,6 +252,35 @@ jobs:
           sudo mv ll-killer /usr/local/bin/ll-killer
           command -v ll-killer
           ll-killer --help | head -5
+
+      # Ubuntu 24.04 runner 的 AppArmor 默认开启
+      # kernel.apparmor_restrict_unprivileged_userns=1，禁止普通进程创建
+      # user namespace。ll-killer 进入 build 阶段后要 unshare(CLONE_NEWUSER)
+      # 并通过 /proc/self/exe 重启自身来搭 mount/pid namespace，被 AppArmor
+      # 拦下时报 "fork/exec /proc/self/exe: operation not permitted"。
+      # 这里关掉该限制（runner 有免密 sudo）；ubuntu-22.04 runner 无此限制。
+      - name: Allow unprivileged user namespaces (Ubuntu 24.04 AppArmor)
+        run: |
+          echo "before: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 'sysctl not present')"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # 持久化到 runner 本机，防止后续步骤/复用环境中被重置
+          echo 'kernel.apparmor_restrict_unprivileged_userns = 0' \
+            | sudo tee /etc/sysctl.d/99-ll-killer-userns.conf > /dev/null
+          echo "after: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+          # 双保险：即使 sysctl 被镜像默认策略覆盖，也给 ll-killer 单独开
+          # unprivileged_userns 的 AppArmor profile（flags=(unprivileged_userns)）
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" != "0" ]; then
+            sudo tee /etc/apparmor.d/ll-killer > /dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile ll-killer /usr/local/bin/ll-killer flags=(unprivileged_userns) {
+            userns,
+            include if exists <local/ll-killer>
+          }
+          PROFILE
+            sudo apparmor_parser -r /etc/apparmor.d/ll-killer
+            echo "apparmor profile for ll-killer installed"
+          fi
 
       - name: Download staged binary
         uses: actions/download-artifact@v4
