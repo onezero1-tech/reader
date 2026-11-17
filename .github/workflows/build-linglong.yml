@@ -49,7 +49,7 @@ on:
 env:
   READER_REPO: onezero1-tech/reader
   # 情况 A：写死 commit sha；情况 B：改成 main / master 跟踪分支
-  READER_REF: dba5d36ce3eae900f2521ad1cb81fd03b96e70e8
+  READER_REF: main
   # 情况 C：发新版本时只改这里（会被 sed 注入 linglong.yaml 的 package.version）
   APP_VERSION: 1.6.6.0
   XDG_RUNTIME_DIR: /run/user/1001
