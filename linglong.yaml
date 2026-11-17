@@ -63,6 +63,7 @@ build: |
   echo '#!/bin/sh' > "$startScript"
   echo 'APPDIR=/opt/apps/com.hadc188.reader/files' >> "$startScript"
   echo 'export LD_LIBRARY_PATH="$APPDIR/usr/lib/x86_64-linux-gnu:$APPDIR/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"' >> "$startScript"
+  echo 'export WEBKIT_DISABLE_DMABUF_RENDERER=1' >> "$startScript"
   echo 'exec "$APPDIR/bin/reader"' >> "$startScript"
   chmod +x "$startScript"
 
