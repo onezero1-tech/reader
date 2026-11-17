@@ -54,7 +54,7 @@ echo "extracted $total debs into $out"
 # 守卫：依赖清单应为 71 个 deb（webkit2gtk + 托盘 + 字体）。少下载会导致
 # layer 缺库，宁可在这里失败也不要打出一个缺依赖的包
 if [ "$total" -ne 71 ]; then
-  echo "ERROR: expected 65 debs but only extracted $total — check debs.txt for corrupted lines" >&2
+  echo "ERROR: expected 71 debs but only extracted $total — check debs.txt for corrupted lines" >&2
   exit 1
 fi
 
@@ -65,6 +65,38 @@ rm -rf "$out/usr/share/applications" 2>/dev/null || true
 rm -rf "$out/usr/share/systemd" 2>/dev/null || true
 rm -rf "$out/usr/lib/systemd" 2>/dev/null || true
 rm -rf "$out/lib/systemd" 2>/dev/null || true
+
+# ---- UAB 体积裁剪（共 ~62MB，均不影响应用运行） ----
+# 设 TRIM_UAB=0 可整体关闭裁剪
+if [ "${TRIM_UAB:-1}" = "1" ]; then
+  echo "trimming payload to shrink uab..."
+  # 1) 运行时用不到的杂项：tex-gyre 字体源文件(.sfd)、软件文档、man 页、
+  #    lintian 覆盖文件、bug 报告脚本、zsh 补全（约 25MB）
+  rm -rf "$out/usr/share/texmf" "$out/usr/share/doc" "$out/usr/share/man" \
+         "$out/usr/share/lintian" "$out/usr/share/bug" "$out/usr/share/zsh"
+  # 2) 拼写检查词典（约 10MB）：hunspell/aspell/ispell。enchant 的后端是
+  #    dlopen 动态加载的插件（usr/lib/x86_64-linux-gnu/enchant-2/*.so），
+  #    缺词典只是"拼写检查不可用"，不会导致任何库加载失败
+  rm -rf "$out/usr/share/hunspell" "$out/usr/share/aspell" "$out/usr/share/ispell" \
+         "$out/usr/lib/aspell" "$out/usr/lib/ispell"
+  # 3) 翻译文件只留 zh_CN/zh_TW/en_US（约省 4.3MB，中文阅读应用够用）
+  #    注意 grep -v 无匹配时返回 1，set -o pipefail 下必须 || true 兜底
+  find "$out/usr/share/locale" -maxdepth 1 -mindepth 1 -type d \
+    | grep -vE '/(zh_CN|zh_TW|zh_SG|en_US)$' | xargs -r rm -rf || true
+  # 4) 基础拉丁字体：freefont/croscore/liberation（约 27MB）。deepin base
+  #    自带 Noto/思源系基础字体，这些是 deb 依赖解析时被拖进来的冗余字体
+  rm -rf "$out/usr/share/fonts/truetype/freefont" "$out/usr/share/fonts/opentype/freefont" \
+         "$out/usr/share/fonts/truetype/croscore" "$out/usr/share/fonts/truetype/liberation"
+  # 5) Noto CJK 字体（约 90MB）：默认保留以保证中文渲染兜底。
+  #    若确认 base（org.deepin.base/25.2.0）已含 CJK 字体，可在 workflow 中
+  #    设 KEEP_CJK_FONTS=0 进一步缩减 90MB（渲染时回退到 base 字体）
+  if [ "${KEEP_CJK_FONTS:-1}" != "1" ]; then
+    rm -rf "$out/usr/share/fonts/opentype/noto"
+    echo "  (KEEP_CJK_FONTS=0) removed Noto CJK fonts (~90MB)"
+  fi
+  du -sh "$out"
+fi
+
 
 # 修复指向 /lib 的绝对软链接（部分 dev 包会创建 so 文件的绝对链接指向 /lib）
 find "$out" -type l | while IFS= read -r file; do
