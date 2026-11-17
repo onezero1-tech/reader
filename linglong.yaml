@@ -9,58 +9,60 @@ package:
     Reader（阅读 3.0 桌面版）——本地阅读器应用，支持书源管理、书架、
     本地书籍阅读、RSS 订阅与自定义阅读界面。基于 Tauri v2 (Rust + Vue 3)。
     主程序由 CI 预先编译（见 .github/workflows/build-linglong.yml 的 build-binary job），
-    本工程只负责把二进制与运行时依赖打包成玲珑 layer。
+    本工程只负责把二进制与少量依赖打包成玲珑应用包。
 
 command: [start-reader]
 
 # ll-builder 只接受最多 3 段的依赖版本（MAJOR.MINOR[.PATCH]），4 段如 25.2.0.92 会在
 # 构建前直接报 "base version is not valid"（apps/ll-builder/src/main.cpp 的
-# Version::validateDependVersion 正则限制）。官方 Tauri demo 同样写 25.2.0，
-# 由 ll-builder 自动解析到该系列最新版本（当前为 25.2.0.94，仅含 binary 模块）。
-# 本工程不在构建容器内编译 Rust，只拷贝预编译二进制，因此不需要
-# base 的 develop 模块——缺失时 ll-builder 仅打印警告，不影响构建。
-base: org.deepin.base/25.2.0
+# Version::validateDependVersion 正则限制）。
+base: org.deepin.base/25.2.2
 
-# webkit2gtk-4.1 等运行库不再以 file sources 方式进容器解包：25.2.0 系列
-# 最新 base（25.2.0.94）的 binary 模块是精简 rootfs，没有 apt-get、binutils、
-# zstd 等工具，容器内无法解包 deb。改为在宿主机 runner 上执行
-# prepare_payload.sh（依赖清单 debs.txt，含 sha256 校验）预解包到 payload/，
-# 随工程挂载进容器（/project/payload）后由下方 build 脚本直接拷贝。
+# webkit2gtk-4.1 / GTK3 / GTK4 / libadwaita / gstreamer / 字体等 GUI 库栈全部由
+# 社区统一 runtime 提供（linglongdev/org.deepin.runtime.gtk4，从源码构建，
+# webkit 以 CMAKE_INSTALL_PREFIX=/runtime 编译，WebKitNetworkProcess 等辅助
+# 进程路径天然指向 /runtime 挂载点，无需应用再打补丁）。
+# 官方默认源（mirror-repo-linglong.deepin.com）已收录该 runtime——
+# 参考实现 onezero1-tech/verge-rev 未加社区源即构建成功。
+# 好处：应用包从 ~330MB 缩到 20MB 以内，内存中也不再重复映射一份 webkit。
+runtime: org.deepin.runtime.gtk4/25.2.2
+
+# runtime 没有托盘库（tauri tray-icon 需要 libayatana-appindicator3 及其依赖，
+# 依赖闭环：appindicator3 -> indicator3 -> ido3 / dbusmenu-gtk3 -> dbusmenu-glib，
+# 其余依赖 gtk3/glib/pango 均由 runtime 提供）。仅这 5 个 deb 在宿主机
+# prepare_payload.sh 解包到 payload/（含 sha256 校验）随工程挂载进容器。
+# 悬空的启动脚本占位 webkit 路径、sed 修补 libwebkit2gtk 等历史 hack 已随
+# runtime 路线整体移除。
 
 build: |
   set -e
 
-  # 本阶段在构建容器内只做纯拷贝与 sed 修补，不联网、不需要 apt/gcc/patchelf：
-  # deb 解包与 RUNPATH 修补已在宿主机 prepare_payload.sh 完成，
+  # 本阶段在构建容器内只做纯拷贝，不联网、不需要 apt/gcc/patchelf。
   # 主程序由 build-binary job 预编译后经 artifact 放到项目根目录。
   test -f /project/reader-desktop || { echo "ERROR: /project/reader-desktop missing"; ls -la /project; exit 1; }
   test -f /project/icons/128x128.png || { echo "ERROR: /project/icons missing"; exit 1; }
   test -d /project/payload/usr || { echo "ERROR: /project/payload missing (prepare_payload.sh 未执行?)"; ls -la /project; exit 1; }
 
-  # ---------- 1. 拷贝预解包的 webkit2gtk-4.1 / 托盘 / 字体依赖到 $PREFIX ----------
-  # 与官方 install_dep 相同：只取 lib、bin、usr 三类路径，其余（etc 等）交给 base
+  # ---------- 1. 拷贝托盘库（runtime 未含的少量依赖）到 $PREFIX ----------
   cp -rP /project/payload/lib $PREFIX/ 2>/dev/null || true
   cp -rP /project/payload/bin $PREFIX/ 2>/dev/null || true
   cp -rP /project/payload/usr/. $PREFIX/
-  cp /project/payload/packages.list $PREFIX/packages.list
 
   # ---------- 2. 安装主程序（预编译产物） ----------
   install -Dm755 /project/reader-desktop $PREFIX/bin/reader
 
-  # ---------- 3. 修补 libwebkit2gtk-4.1.so.0 中硬编码的 WebKitNetworkProcess 路径 ----------
-  # 用等长占位串替换，保证 ELF 内偏移不变（与官方 Tauri 示例做法一致）
-  tmpdir=`mktemp -d /tmp/lib_XXXXXXXXXXXXXXXX_webkit2gtk-4.1`
-  sed -i -b "s|/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1|$tmpdir|g" $PREFIX/lib/x86_64-linux-gnu/libwebkit2gtk-4.1.so.0
-
-  # ---------- 4. 启动脚本：启动时把 $PREFIX 下的 webkit2gtk-4.1 链接到占位路径 ----------
+  # ---------- 3. 启动脚本 ----------
+  # 托盘库装在应用自己的 lib 下，启动时补进 LD_LIBRARY_PATH；
+  # webkit 等其余依赖由 runtime 层自动提供，无需任何路径 hack。
+  # （用 echo 而非 heredoc，避免 YAML 块内缩进干扰）
   startScript="$PREFIX/bin/start-reader"
-  echo "#!/bin/sh" > $startScript
-  echo "rm -r $tmpdir" >> $startScript
-  echo "ln -s $PREFIX/lib/x86_64-linux-gnu/webkit2gtk-4.1 $tmpdir" >> $startScript
-  echo "reader" >> $startScript
-  chmod +x $startScript
+  echo '#!/bin/sh' > "$startScript"
+  echo 'APPDIR=/opt/apps/com.hadc188.reader/files' >> "$startScript"
+  echo 'export LD_LIBRARY_PATH="$APPDIR/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"' >> "$startScript"
+  echo 'exec reader' >> "$startScript"
+  chmod +x "$startScript"
 
-  # ---------- 5. 图标与桌面入口 ----------
+  # ---------- 4. 图标与桌面入口 ----------
   install -Dm644 /project/icons/128x128.png $PREFIX/share/icons/hicolor/128x128/apps/com.hadc188.reader.png
   install -Dm644 /project/icons/icon.png $PREFIX/share/icons/hicolor/256x256/apps/com.hadc188.reader.png
   mkdir -p $PREFIX/share/applications

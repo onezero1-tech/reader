@@ -51,10 +51,11 @@ while read -r url sha; do
   echo "Package: $(dpkg-deb -f "$deb" Package)" >> "$out/packages.list"
 done < "$deb_list"
 echo "extracted $total debs into $out"
-# 守卫：依赖清单应为 71 个 deb（webkit2gtk + 托盘 + 字体）。少下载会导致
-# layer 缺库，宁可在这里失败也不要打出一个缺依赖的包
-if [ "$total" -ne 71 ]; then
-  echo "ERROR: expected 71 debs but only extracted $total — check debs.txt for corrupted lines" >&2
+# 守卫：解包数量必须等于 debs.txt 中的 URL 行数（下载失败/文件损坏时在这里
+# 失败，宁可失败也不要打出一个缺依赖的包）。清单条目数改动后无需改这里
+expected=$(grep -cE '^[[:space:]]*https?://' "$deb_list" || true)
+if [ "$total" -ne "$expected" ]; then
+  echo "ERROR: debs.txt has $expected debs but only extracted $total — check debs.txt for corrupted lines" >&2
   exit 1
 fi
 
