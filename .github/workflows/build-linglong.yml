@@ -1,0 +1,267 @@
+# Reader 玲珑包 CI —— 双 job 流水线（编译 + 打包，缓存互相独立）
+#
+# 代码更新后的操作说明：
+#   情况 A（发布固定版本）：把 env.READER_REF 改成目标 commit 的完整 sha
+#   情况 B（跟踪分支最新提交）：env.READER_REF 填分支名（main/master）。
+#       缓存 key 已包含实际源码 commit sha（SOURCE_SHA），每个提交自动
+#       重新编译；同一次构建重跑（re-run）仍命中缓存。无需手动清缓存。
+#   情况 C（版本变更）：只改下方 APP_VERSION 一处，会自动注入 linglong.yaml
+#       的 package.version（注意保持 1.6.5.0 这种纯数字格式）。
+#   依赖层 debs.txt 不变时，payload 缓存永远命中——代码更新只重跑编译 job。
+
+name: Build Linglong Package
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要编译的 reader ref（commit sha 或分支，留空 = READER_REF）'
+        required: false
+        default: ''
+
+env:
+  READER_REPO: onezero1-tech/reader
+  # 情况 A：写死 commit sha；情况 B：改成 main / master 跟踪分支
+  READER_REF: main
+  # 情况 C：发新版本时只改这里（会被 sed 注入 linglong.yaml 的 package.version）
+  APP_VERSION: 1.6.6.0
+  XDG_RUNTIME_DIR: /run/user/1001
+
+jobs:
+  # ================= job 1: 编译 reader-desktop（与玲珑无关，独立缓存） =================
+  build-binary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout reader source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.READER_REPO }}
+          ref: ${{ github.event.inputs.ref || env.READER_REF }}
+
+      # 缓存 key 的代码版本成分：checkout 到哪个 commit 就用哪个，
+      # 这样 READER_REF 填分支名（情况 B）时每个提交也会产生独立缓存键
+      - name: Resolve source commit for cache key
+        run: echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Restore staged binary
+        id: bin-cache
+        uses: actions/cache@v4
+        with:
+          path: stage/
+          # 注意：不要加 restore-keys，否则新代码会回退到旧二进制
+          key: reader-desktop-binary-${{ env.SOURCE_SHA }}
+
+      - name: Validate staged files
+        id: staged
+        run: |
+          ok=true
+          for f in stage/reader-desktop stage/icons/128x128.png stage/icons/icon.png; do
+            [ -f "$f" ] || { echo "missing: $f"; ok=false; }
+          done
+          echo "valid=$ok" >> "$GITHUB_OUTPUT"
+
+      # ---------- 以下构建步骤仅在缓存未命中或缓存不完整时执行 ----------
+      - name: Install system dependencies
+        if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev pkg-config file
+
+      - name: Setup Node 22
+        if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Setup Rust stable
+        if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          # cargo workspace 根在仓库根（Cargo.lock / target/ 都在根目录）
+          workspaces: .
+
+      - name: Build frontend
+        if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build desktop (tauri --no-bundle)
+        if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
+        working-directory: desktop
+        run: |
+          npm ci
+          npx tauri build --no-bundle
+
+      - name: Stage artifacts
+        if: steps.bin-cache.outputs.cache-hit != 'true' || steps.staged.outputs.valid != 'true'
+        run: |
+          # tauri 在 desktop/ 下执行，但 cargo workspace 根在仓库根，产物用 find 定位
+          bin=$(find "$GITHUB_WORKSPACE" -type f -name reader-desktop -path '*/release/*' -print -quit)
+          if [ -z "$bin" ]; then
+            echo "ERROR: reader-desktop not found, candidates:"
+            find "$GITHUB_WORKSPACE" -type f -name 'reader-desktop' | head -20
+            exit 1
+          fi
+          echo "staging: $bin"
+          mkdir -p stage/icons
+          install -Dm755 "$bin" stage/reader-desktop
+          cp desktop/src-tauri/icons/128x128.png stage/icons/128x128.png
+          cp desktop/src-tauri/icons/icon.png     stage/icons/icon.png
+
+      - name: Upload staged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader-binary
+          path: stage/
+          retention-days: 7
+
+  # ================= job 2: 打玲珑包（复用 payload 缓存，不编译代码） =================
+  package-linglong:
+    needs: build-binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      # 关键：这里 checkout 默认 ref（触发本次 CI 的提交），保证拿到最新的
+      # linglong.yaml / debs.txt / prepare_payload.sh。
+      # 不要改成 READER_REF——那是给源码编译用的；指向旧 commit 会因缺少
+      # linglong.yaml 报 "the project file is not found"。
+      - name: Checkout packaging project
+        uses: actions/checkout@v4
+
+      # 显式守卫：工程文件缺失时立刻报错并列出目录，不再等到 ll-builder 才失败
+      - name: Guard packaging files present
+        run: |
+          pwd
+          ls -la
+          test -f linglong.yaml      || { echo "ERROR: linglong.yaml missing"; exit 1; }
+          test -f debs.txt           || { echo "ERROR: debs.txt missing"; exit 1; }
+          test -f prepare_payload.sh || { echo "ERROR: prepare_payload.sh missing"; exit 1; }
+
+      # 情况 C：把 APP_VERSION 注入 linglong.yaml，发版只改 workflow 顶部一处
+      # （sed 只匹配两段缩进的 version，即 package.version；顶层的 version: '1' 不受影响）
+      - name: Inject app version
+        run: |
+          sed -i "s/^  version: .*/  version: ${APP_VERSION}/" linglong.yaml
+          grep -n 'version' linglong.yaml
+
+      - name: Prepare XDG runtime dir
+        run: |
+          sudo mkdir -p "$XDG_RUNTIME_DIR"
+          sudo chown -R 1001:1001 "$XDG_RUNTIME_DIR"
+          sudo chmod 0700 "$XDG_RUNTIME_DIR"
+
+      - name: Install linglong toolchain
+        run: |
+          # 官方 apt 源在 ci.deepin.com 的 OBS 镜像上（注意目录名是 Ubuntu_24.04，
+          # 不是 opensuse.org 的 xUbuntu_24.04——那个路径不存在，会 404）
+          echo "deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Ubuntu_24.04/ ./" \
+            | sudo tee /etc/apt/sources.list.d/linyaps.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y linglong-builder linglong-box linglong-bin
+          ll-builder --version
+
+      - name: Download staged binary
+        uses: actions/download-artifact@v4
+        with:
+          name: reader-binary
+          path: staged
+
+      - name: Place binary & icons at project root
+        run: |
+          cp staged/reader-desktop ./reader-desktop
+          mkdir -p icons
+          cp staged/icons/128x128.png icons/128x128.png
+          cp staged/icons/icon.png    icons/icon.png
+          ls -la reader-desktop icons/
+
+      - name: Restore deb payload
+        id: payload-cache
+        uses: actions/cache@v4
+        with:
+          path: payload/
+          # 只由 debs.txt 内容决定——代码更新不影响此缓存
+          key: deb-payload-${{ hashFiles('debs.txt') }}
+
+      - name: Install payload tools
+        run: sudo apt-get install -y patchelf file curl
+
+      - name: Prepare payload (download & unpack debs)
+        run: |
+          # 以磁盘上的实际完整性为准，而不是缓存命中标记：
+          # 缓存命中但恢复内容不完整时自动重新下载解包，避免静默缺文件
+          # 注意：deepin 的 deb 是 usr-merged 布局，库在 payload/usr/lib/，
+          # 不是 payload/lib/（后者只是部分 deb 带来的空目录）
+          if [ -f payload/usr/lib/x86_64-linux-gnu/libwebkit2gtk-4.1.so.0 ] \
+             && [ -d payload/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1 ] \
+             && [ -f payload/packages.list ]; then
+            echo "payload already complete (from cache), skip download"
+            exit 0
+          fi
+          bash prepare_payload.sh debs.txt payload
+
+      - name: Verify payload
+        run: |
+          echo "== payload/ top-level =="
+          ls -la payload/ 2>/dev/null || echo "(payload/ not found)"
+          echo "== payload/usr/lib/x86_64-linux-gnu (first 5) =="
+          ls payload/usr/lib/x86_64-linux-gnu/ 2>/dev/null | head -5 || true
+          # deepin 的 deb 是 usr-merged 布局：库文件在 usr/lib 下
+          test -d payload/usr/lib/x86_64-linux-gnu \
+            || { echo "FAIL: payload/usr/lib/x86_64-linux-gnu missing"; exit 1; }
+          test -f payload/usr/lib/x86_64-linux-gnu/libwebkit2gtk-4.1.so.0 \
+            || { echo "FAIL: libwebkit2gtk-4.1.so.0 missing (debs.txt 缺少 webkit2gtk 相关条目?)"; exit 1; }
+          test -d payload/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1 \
+            || { echo "FAIL: webkit2gtk-4.1/ dir missing (linglong.yaml 修补 WebKitNetworkProcess 路径需要它)"; exit 1; }
+          test -f payload/packages.list \
+            || { echo "FAIL: packages.list missing"; exit 1; }
+          du -sh payload
+          count=$(wc -l < payload/packages.list)
+          echo "packages.list lines: $count"
+          [ "$count" -eq 71 ] || { echo "FAIL: packages.list 应为 71 个包，实际 $count"; exit 1; }
+
+      - name: Restore ll-builder cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/linglong-builder/
+          key: linglong-builder-cache-x86_64
+
+      - name: ll-builder build
+        run: ll-builder build
+
+      - name: ll-builder export (UAB)
+        run: |
+          # linglong-builder >= 1.6 的 export 不再接受位置参数（文件名），
+          # 传文件名会报 "The following argument was not expected" (exit 109)。
+          # 默认导出 UAB 格式（推荐），输出文件名自动生成：
+          #   com.hadc188.reader_${APP_VERSION}_x86_64.uab
+          # UAB 默认只导出 binary 模块（exportUAB 中 modules 为空时默认 binary），
+          # 不会生成 develop 文件；--no-develop 仅对 --layer 模式有效，UAB 不需要。
+          ll-builder export
+          echo "== exported uab files =="
+          ls -la com.hadc188.reader_*.uab
+          uab_count=$(ls com.hadc188.reader_*.uab 2>/dev/null | wc -l)
+          [ "$uab_count" -ge 1 ] || { echo "FAIL: no .uab file generated"; exit 1; }
+
+      - name: Upload uab artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader-linglong-uab
+          path: com.hadc188.reader_*.uab
+          retention-days: 30
+
+      # 打 tag 时自动把 uab 挂到 GitHub Release
+      - name: Release uab
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: com.hadc188.reader_*.uab
