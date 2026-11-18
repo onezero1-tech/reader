@@ -58,6 +58,7 @@ async fn route(
         "/sourcePanelBridge" => source_panel_bridge_route(state, query, &request).await,
         "/sourcePanel" => source_panel_route(state, query, &request).await,
         "/cover" => cover_route(state, query).await,
+        "/img" => img_route(state, query).await,
         "/epub" => epub_route(state, query).await,
         "/pdf" => pdf_route(state, query).await,
         "/files" => files_route(state, query).await,
@@ -696,6 +697,71 @@ pub(crate) fn remove_cover_cache_urls(urls: &[String]) {
         for url in urls {
             cache.remove(url);
         }
+    }
+}
+
+/// 正文插图(/img)的进程内缓存, 与封面缓存同理: WebView2 不缓存自定义协议响应。
+/// 一章漫画常有上百张图, 上限给得比封面宽。
+const IMG_CACHE_CAP: usize = 500;
+
+fn content_image_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, (Vec<u8>, String)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (Vec<u8>, String)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 正文插图代理: `/img?path=<图片地址(可含 ,{json} 选项)>&source=<bookSourceUrl>`。
+///
+/// 阅读页的 `<img>` 由 WebView 直接加载远程地址时无法携带书源 headers —— 有
+/// 防盗链的图床(不带站内 Referer 一律 403)会整章裂图。这里由后端用书源会话
+/// client 下载后回传字节, 请求选项的解析与 header 合并交给
+/// `book_service::get_content_image_for_source`(与正文/封面同一套语义)。
+///
+/// `path` 是**原始 src**(含 `,{json}`): 后端要靠它解析请求选项。
+/// `source` 是书籍所属书源的 `bookSourceUrl`, 用于反查书源(合并书源级 header);
+/// 缺省时按地址在书架里反查一次, 找不到也不影响下载(只是不带书源 header)。
+pub async fn img_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
+    let params: HashMap<String, String> =
+        serde_urlencoded::from_str(query).unwrap_or_default();
+    let url = params.get("path").map(String::as_str).unwrap_or_default();
+    if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return http::Response::builder()
+            .status(404)
+            .body(Vec::new())
+            .unwrap_or_default();
+    }
+
+    let cache_key = url.to_string();
+    if let Some((bytes, content_type)) = content_image_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        return bytes_response(bytes, &content_type, Some("86400"));
+    }
+
+    let source = resolve_cover_source(state, params.get("source").map(String::as_str), url).await;
+
+    match state
+        .book_service
+        .get_content_image_for_source("public", url, source.as_ref())
+        .await
+    {
+        Ok((bytes, content_type)) => {
+            if let Ok(mut cache) = content_image_cache().lock() {
+                if cache.len() >= IMG_CACHE_CAP {
+                    cache.clear();
+                }
+                cache.insert(cache_key, (bytes.clone(), content_type.clone()));
+            }
+            bytes_response(bytes, &content_type, Some("86400"))
+        }
+        Err(_) => http::Response::builder()
+            .status(404)
+            .body(Vec::new())
+            .unwrap_or_default(),
     }
 }
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  buildProxiedImageUrl,
   ensureSvgNamespace,
   parseSourceImageOptions,
   processSourceImageOptions,
@@ -129,6 +130,71 @@ describe('processSourceImageOptions（用最小 DOM 桩，不依赖 jsdom）', (
     const { classes, attrs } = runOn(bad)
     expect(attrs.get('src')).toBe(bad)
     expect(classes.has('source-clickable')).toBe(false)
+  })
+})
+
+describe('buildProxiedImageUrl / 正文插图代理改写', () => {
+  /** 与上面同一套 DOM 桩，但允许传入 source。 */
+  function runOnWithSource(rawSrc: string, source?: string) {
+    const classes = new Set<string>()
+    const attrs = new Map<string, string>([['src', rawSrc]])
+    const image = {
+      dataset: {} as Record<string, string>,
+      style: {} as Record<string, string>,
+      classList: {
+        add: (name: string) => classes.add(name),
+        contains: (name: string) => classes.has(name),
+      },
+      getAttribute: (name: string) => attrs.get(name) ?? null,
+      setAttribute: (name: string, value: string) => attrs.set(name, value),
+    }
+    const root = {
+      querySelectorAll: () => [image],
+    } as unknown as HTMLElement
+    processSourceImageOptions(root, source)
+    return { image, classes, attrs }
+  }
+
+  // 楠楠漫画的正文图片形态: 远程地址 + 书源 headers 选项
+  const MANGA_SRC =
+    'https://img.example/book/1/1.jpg,' +
+    '{"headers":{"Referer":"https://site.example/"}}'
+
+  it('远程图片改写成 /img 代理，path 保留原始 src(含选项)', () => {
+    const proxied = buildProxiedImageUrl(MANGA_SRC, 'https://img.example/book/1/1.jpg', 'https://site.example/')
+    expect(proxied).not.toBeNull()
+    expect(proxied!).toContain('/img?')
+    expect(proxied!).toContain('path=' + encodeURIComponent(MANGA_SRC))
+    expect(proxied!).toContain('&source=' + encodeURIComponent('https://site.example/'))
+  })
+
+  it('data: URI(段评气泡)不进代理', () => {
+    expect(buildProxiedImageUrl(REAL_SRC, 'data:image/svg+xml;base64,AAAA', 'https://site.example/')).toBeNull()
+  })
+
+  it('processSourceImageOptions 带 source 时把远程图片 src 改写为代理地址', () => {
+    const { attrs, image } = runOnWithSource(MANGA_SRC, 'https://site.example/')
+    const produced = attrs.get('src') || ''
+    expect(produced).toContain('/img?')
+    expect(produced).toContain('path=' + encodeURIComponent(MANGA_SRC))
+    // 原始 src 保留给 click 脚本的 result
+    expect(image.dataset.sourceRawSrc).toBe(MANGA_SRC)
+  })
+
+  it('processSourceImageOptions 不带 source 时仍改写(后端按地址反查)', () => {
+    const { attrs } = runOnWithSource(MANGA_SRC)
+    const produced = attrs.get('src') || ''
+    expect(produced).toContain('/img?')
+    expect(produced).not.toContain('source=')
+  })
+
+  it('data: 气泡的处理不受影响(仍剥离 JSON 并补 xmlns)', () => {
+    const { attrs, image, classes } = runOnWithSource(REAL_SRC, 'https://site.example/')
+    const produced = attrs.get('src') || ''
+    expect(produced.startsWith('data:image/svg+xml;base64,')).toBe(true)
+    expect(produced).not.toContain('/img?')
+    expect(image.dataset.sourceClick).toBe('showConfigPanel()')
+    expect(classes.has('source-inline-bubble')).toBe(true)
   })
 })
 

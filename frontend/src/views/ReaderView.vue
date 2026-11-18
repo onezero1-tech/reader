@@ -1389,7 +1389,7 @@ function formatChapterHtml(rawText: string) {
   }
 
   rewriteLocalEpubAssetSrcs(wrapper)
-  processSourceImageOptions(wrapper)
+  processSourceImageOptions(wrapper, store.book?.origin || '')
   reserveImageSpace(wrapper)
   highlightSearchText(wrapper)
   return wrapper.innerHTML

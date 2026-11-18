@@ -3526,6 +3526,170 @@ impl BookService {
         Ok((bytes, content_type))
     }
 
+    /// 取正文插图，按书源合并请求头后下载。
+    ///
+    /// 正文里的 `<img>` 此前由 WebView 直接加载远程地址，浏览器带不上书源
+    /// `,{headers}` 里的 Referer/UA —— 有防盗链的图床（楠楠漫画等，不带站内
+    /// Referer 一律 403）在阅读页必然整章裂图。这条链路把图片地址交给后端：
+    /// `analyze_url` 解析地址里携带的 `,{json}` 请求选项并与书源级 `header`
+    /// 合并（与 legado 手机端 Glide 加载图片的 header 语义一致），用书源会话
+    /// client（共享该源 cookie）下载后回传字节。
+    ///
+    /// 与封面（[`Self::get_cover_for_source`]）的差异：
+    /// - 没有封面特有的「签名 `%3D` 修复 / 历史布局迁移」兜底；
+    /// - 解密脚本取 `ruleContent.imageDecode`（legado 的 `ImageUtils.decode(
+    ///   bytes, isCover = false, source)`），而不是 `coverDecodeJs`；
+    /// - 缓存目录是 `cache/<user_ns>/img/`，与封面分开，互不挤占。
+    pub async fn get_content_image_for_source(
+        &self,
+        user_ns: &str,
+        raw_url: &str,
+        source: Option<&BookSource>,
+    ) -> Result<(Vec<u8>, String), AppError> {
+        let raw_url = raw_url.trim();
+        let img_dir = self.storage_dir.join("cache").join(user_ns).join("img");
+        let mapping_path = img_dir.join("urls").join(format!("{}.json", md5_hex(raw_url)));
+        if let Ok(mapped) = fs::read_to_string(&mapping_path).await {
+            let entry: serde_json::Value =
+                serde_json::from_str(&mapped).unwrap_or(serde_json::Value::Null);
+            let file = entry.get("file").and_then(serde_json::Value::as_str);
+            let content_type = entry
+                .get("contentType")
+                .and_then(serde_json::Value::as_str);
+            if let (Some(file), Some(content_type)) = (file, content_type) {
+                if let Ok(data) = fs::read(img_dir.join(file)).await {
+                    return Ok((data, content_type.to_string()));
+                }
+            }
+        }
+        if let Some(parent) = mapping_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| AppError::Internal(e.into()))?;
+        }
+
+        // 地址里可能带 `,{...}` 请求选项（甚至 js 选项）：与正文请求同一套
+        // `analyze_url` 解析 —— 选项 headers 与书源级 header 合并，UA 缺省时补
+        // 默认值。JS 求值可能发同步请求，必须放阻塞线程池（见 run_source_task）。
+        let spec = match source {
+            Some(source) => {
+                let raw = raw_url.to_string();
+                let base = source.book_source_url.clone();
+                self.run_source_task(user_ns, source, move |source| {
+                    analyze_url(&raw, "", 1, &base, source)
+                })
+                .await?
+                .map_err(|err| AppError::BadRequest(format!("正文图片地址解析失败: {err}")))?
+            }
+            None => analyze_url(raw_url, "", 1, raw_url, &BookSource::default())
+                .map_err(|err| AppError::BadRequest(format!("正文图片地址解析失败: {err}")))?,
+        };
+
+        // 走书源会话 client（带该源 cookie）。代理出口被站点 WAF 拦下
+        // （403/407/451 或发送失败）时直连重试一次，判据与封面相同。
+        let source_url = source
+            .map(|s| s.book_source_url.clone())
+            .unwrap_or_default();
+        let context = self
+            .http
+            .source_context(user_ns, &source_url, None)
+            .map_err(AppError::Internal)?;
+        let build_request = |client: &reqwest::Client| {
+            let mut req = client.get(&spec.url);
+            for (name, value) in &spec.headers {
+                if let (Ok(name), Ok(value)) = (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(value),
+                ) {
+                    req = req.header(name, value);
+                }
+            }
+            req
+        };
+        let mut res = build_request(&context.client).send().await;
+        let retry_status = match &res {
+            Ok(response) => Some(response.status().as_u16()),
+            Err(_) => None,
+        };
+        if cover_needs_direct_retry(context.proxy.is_some(), retry_status) {
+            if let Ok(direct) = self.http.source_context_direct(user_ns, &source_url) {
+                if let Ok(direct_res) = build_request(&direct.client).send().await {
+                    if direct_res.status().is_success() {
+                        tracing::info!(url = %spec.url, "proxy image request blocked; used direct retry");
+                        res = Ok(direct_res);
+                    }
+                }
+            }
+        }
+        let res = res.map_err(|e| AppError::Internal(e.into()))?;
+        if !res.status().is_success() {
+            return Err(AppError::NotFound("image not found".to_string()));
+        }
+        let content_type = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let bytes = res
+            .bytes()
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?
+            .to_vec();
+
+        // 书源带 ruleContent.imageDecode → 解密后再当图片处理（legado 的
+        // `ImageUtils.decode(bytes, isCover = false, source)`）。解密链与封面
+        // 相同（eval_js_cover_decode 在 `__byteMode` 下让 decrypt 返回原始字节）。
+        // 两条兜底与封面一致：脚本报错 → 原始字节；解出来不是图片但原始字节
+        // 本来就是图片 → 原始字节。
+        let decode_script = source
+            .and_then(|s| s.rule_content.as_ref())
+            .and_then(|rule| rule.image_decode.as_deref())
+            .map(str::trim)
+            .filter(|script| !script.is_empty());
+        let bytes = match (decode_script, source) {
+            (Some(script), Some(source)) => {
+                let script = script.to_string();
+                let src = spec.url.clone();
+                let raw = bytes.clone();
+                match self
+                    .run_source_task(user_ns, source, move |_source| {
+                        crate::parser::js::eval_js_cover_decode(&script, &src, &raw)
+                            .map_err(|err| AppError::BadRequest(format!("图片解密失败: {err}")))
+                    })
+                    .await?
+                {
+                    Ok(decoded)
+                        if !decoded.is_empty()
+                            && (sniff_image_content_type(&decoded).is_some()
+                                || sniff_image_content_type(&bytes).is_none()) =>
+                    {
+                        decoded
+                    }
+                    _ => {
+                        tracing::debug!(url = %spec.url, "图片解密结果不可用，保留原始字节");
+                        bytes
+                    }
+                }
+            }
+            _ => bytes,
+        };
+        // 服务器给的 content-type 描述不了图片内容时（octet-stream 等），按
+        // 魔数认格式最可靠（与封面同一处理）。
+        let content_type = if is_unknown_image_type(&content_type) {
+            sniff_image_content_type(&bytes).unwrap_or(content_type)
+        } else {
+            content_type
+        };
+        if let Err(err) = self
+            .store_cover_mapping(raw_url, &bytes, &content_type, &img_dir)
+            .await
+        {
+            tracing::warn!("写入图片缓存失败: {err:?}");
+        }
+        Ok((bytes, content_type))
+    }
+
     /// 缓存命中时的解密补救。
     ///
     /// 修复前落盘的封面是**密文**（解密逻辑此前不存在），映射里记的
