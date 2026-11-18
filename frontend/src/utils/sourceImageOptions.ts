@@ -1,3 +1,4 @@
+import { assetUrl } from '../api/scheme'
 import { readSourceLiteral } from './sourceLiteral'
 
 /**
@@ -119,10 +120,35 @@ export function reserveImageSpace(root: HTMLElement) {
 }
 
 /**
- * 处理正文容器里的所有图片：剥离 `,{json}`、标记可点击、按 `style:text` 呈现为行内气泡。
- * 直接修改传入的 DOM（与 `formatChapterHtml` 的其余后处理一致）。
+ * 把书源正文图片地址改写成后端 `/img` 代理地址。
+ *
+ * WebView 直接加载远程图片时无法携带 `,{json}` 里的 Referer/UA —— 有防盗链
+ * 的图床（如楠楠漫画的 img.yidanmh.xyz，不带站内 Referer 一律 403）在阅读页
+ * 必然整章裂图。改写成 `/img?path=<原始src>&source=<书源地址>` 后由后端
+ * 解析请求选项、与书源级 header 合并后下载，与 legado 手机端（Glide 可带
+ * headers）同一语义。
+ *
+ * `path` 传**原始 src**（含 `,{json}`）：后端要用它解析请求选项。
+ * `data:` URI（段评气泡）与已本地化的资源不进代理，返回 null。
  */
-export function processSourceImageOptions(root: HTMLElement) {
+export function buildProxiedImageUrl(rawSrc: string, url: string, source?: string): string | null {
+  if (!/^https?:\/\//i.test(url.trim())) return null
+  const query = `path=${encodeURIComponent(rawSrc)}`
+  const origin = source?.trim()
+  return origin
+    ? assetUrl(`/img?${query}&source=${encodeURIComponent(origin)}`)
+    : assetUrl(`/img?${query}`)
+}
+
+/**
+ * 处理正文容器里的所有图片：剥离 `,{json}`、改写远程图片为 `/img` 代理、
+ * 标记可点击、按 `style:text` 呈现为行内气泡。
+ * 直接修改传入的 DOM（与 `formatChapterHtml` 的其余后处理一致）。
+ *
+ * `source` 是书籍所属书源的 `bookSourceUrl`（`book.origin`），后端拿它
+ * 反查书源以合并书源级 header；缺省时后端也能按地址反查，只是多一次查找。
+ */
+export function processSourceImageOptions(root: HTMLElement, source?: string) {
   const images = Array.from(root.querySelectorAll('img')) as HTMLImageElement[]
   images.forEach((image) => {
     const rawSrc = image.getAttribute('src') || ''
@@ -130,7 +156,11 @@ export function processSourceImageOptions(root: HTMLElement) {
     if (!parsed) return
 
     image.dataset.sourceRawSrc = rawSrc
-    image.setAttribute('src', ensureSvgNamespace(parsed.url))
+    // 远程书源图片改走后端代理（带书源 headers）；data: 等其余地址保持直读。
+    image.setAttribute(
+      'src',
+      buildProxiedImageUrl(rawSrc, parsed.url, source) ?? ensureSvgNamespace(parsed.url),
+    )
 
     if (parsed.click) {
       image.dataset.sourceClick = parsed.click

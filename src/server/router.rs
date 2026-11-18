@@ -148,6 +148,7 @@ pub fn build(state: AppState, _options: WebOptions, static_source: Option<Static
         .route("/reader3/deleteReplaceRules", post(delete_replace_rules))
         // ─── 资源 ───
         .route("/cover", get(cover))
+        .route("/img", get(img))
         .route("/pdf", get(pdf))
         .route("/epub", get(epub))
         .route("/files", get(files))
@@ -592,6 +593,10 @@ fn query_string(uri: &Uri) -> String {
 
 async fn cover(State(state): State<AppState>, uri: Uri) -> Response {
     from_tauri_response(crate::api::protocol::cover_route(&state, &query_string(&uri)).await)
+}
+
+async fn img(State(state): State<AppState>, uri: Uri) -> Response {
+    from_tauri_response(crate::api::protocol::img_route(&state, &query_string(&uri)).await)
 }
 
 async fn pdf(State(state): State<AppState>, uri: Uri) -> Response {
