@@ -203,19 +203,29 @@ describe('reserveImageSpace（用最小 DOM 桩，不依赖 jsdom）', () => {
     attrs?: Record<string, string>
     classes?: string[]
     style?: Record<string, string>
+    complete?: boolean
+    naturalWidth?: number
+    naturalHeight?: number
   }) {
     const attrs = new Map<string, string>(Object.entries(opts.attrs ?? {}))
     const classes = new Set(opts.classes ?? [])
     const style: Record<string, string> = { ...(opts.style ?? {}) }
+    const loadHandlers: Array<() => void> = []
     const image = {
       style,
       classList: { contains: (name: string) => classes.has(name) },
       hasAttribute: (name: string) => attrs.has(name),
+      complete: opts.complete,
+      naturalWidth: opts.naturalWidth,
+      naturalHeight: opts.naturalHeight,
+      addEventListener: (type: string, handler: () => void) => {
+        if (type === 'load') loadHandlers.push(handler)
+      },
     }
-    return image
+    return { image, loadHandlers }
   }
 
-  function runOn(images: ReturnType<typeof makeImage>[]) {
+  function runOn(images: Array<ReturnType<typeof makeImage>['image']>) {
     const root = { querySelectorAll: () => images } as unknown as HTMLElement
     reserveImageSpace(root)
     return images
@@ -223,13 +233,13 @@ describe('reserveImageSpace（用最小 DOM 桩，不依赖 jsdom）', () => {
 
   it('leaves an image that already declares width and height alone', () => {
     // 书源插图常带这两个属性, 浏览器据此即可在加载前按比例占位。
-    const [image] = runOn([makeImage({ attrs: { width: '1024', height: '576' } })])
+    const [image] = runOn([makeImage({ attrs: { width: '1024', height: '576' } }).image])
 
     expect(image.style.aspectRatio).toBeUndefined()
   })
 
   it('reserves space when the image has no intrinsic size', () => {
-    const [image] = runOn([makeImage({ attrs: { src: 'a.jpg' } })])
+    const [image] = runOn([makeImage({ attrs: { src: 'a.jpg' } }).image])
 
     // width 与 aspect-ratio 必须成对: 未加载的图片固有宽度是 0,
     // 没有确定宽度就换算不出占位高度。
@@ -239,7 +249,7 @@ describe('reserveImageSpace（用最小 DOM 桩，不依赖 jsdom）', () => {
   })
 
   it('reserves space when only one dimension is given', () => {
-    const [image] = runOn([makeImage({ attrs: { width: '1024' } })])
+    const [image] = runOn([makeImage({ attrs: { width: '1024' } }).image])
 
     expect(image.style.width).toBe('100%')
     expect(image.style.aspectRatio).toBe('16 / 9')
@@ -247,15 +257,55 @@ describe('reserveImageSpace（用最小 DOM 桩，不依赖 jsdom）', () => {
 
   it('leaves commentary bubbles alone', () => {
     // 气泡有自己固定的行内尺寸, 再套宽高比会把它撑成整段高图。
-    const [image] = runOn([makeImage({ classes: ['source-inline-bubble'] })])
+    const [image] = runOn([makeImage({ classes: ['source-inline-bubble'] }).image])
 
     expect(image.style.aspectRatio).toBeUndefined()
   })
 
   it('does not override a size the source already set', () => {
-    const [image] = runOn([makeImage({ style: { width: '110px' } })])
+    const [image] = runOn([makeImage({ style: { width: '110px' } }).image])
 
     expect(image.style.aspectRatio).toBeUndefined()
+  })
+
+  it('load 完成后把 16:9 占位换成图片固有比例(修复竖图拉伸)', () => {
+    // 竖版漫画页: 元素盒子若一直是 16:9, 位图会被压成横条。
+    const { image, loadHandlers } = makeImage({ attrs: { src: 'p1.jpg' } })
+    runOn([image])
+    expect(image.style.aspectRatio).toBe('16 / 9')
+
+    image.naturalWidth = 800
+    image.naturalHeight = 1200
+    loadHandlers.forEach((handler) => handler())
+
+    expect(image.style.aspectRatio).toBe('800 / 1200')
+    expect(image.style.width).toBe('100%')
+    expect(image.style.height).toBe('auto')
+  })
+
+  it('缓存命中的 complete 图片同步结算固有比例, 不等 load 事件', () => {
+    const { image } = makeImage({
+      attrs: { src: 'cached.jpg' },
+      complete: true,
+      naturalWidth: 1080,
+      naturalHeight: 360,
+    })
+    runOn([image])
+
+    expect(image.style.aspectRatio).toBe('1080 / 360')
+  })
+
+  it('加载失败(naturalWidth 为 0)时保留 16:9 占位', () => {
+    const { image, loadHandlers } = makeImage({
+      attrs: { src: 'broken.jpg' },
+      complete: true,
+      naturalWidth: 0,
+      naturalHeight: 0,
+    })
+    runOn([image])
+
+    loadHandlers.forEach((handler) => handler())
+    expect(image.style.aspectRatio).toBe('16 / 9')
   })
 })
 
