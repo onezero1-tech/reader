@@ -25,20 +25,34 @@ export function parseExploreCategories(rule?: string | null): ExploreCategory[] 
   const trimmedRule = rule?.trim()
   if (!trimmedRule) return []
 
-  try {
-    if (trimmedRule.startsWith('[')) {
-      const parsed = JSON.parse(normalizeRelaxedExploreJson(trimmedRule))
-      if (Array.isArray(parsed)) {
-        return parsed
-          .map((item) => ({
-            title: String(item?.title || '').trim(),
-            url: String(item?.url || '').trim(),
-          }))
-          .filter((item) => item.title)
+  // 双转义恢复：个别导入链路会把 exploreUrl 里的换行/引号再转义一次，存进
+  // 来的 JSON 里全是字面 `\n`（两个字符）—— 整段被压成一行非法 JSON，
+  // JSON.parse 必失败，文本切分也切不开（没有真实换行），发现页于是只剩
+  // 一个分类。检测到「以 [ / { 开头 + 含字面转义序列」时先反转义再试。
+  const candidates = [trimmedRule]
+  if (
+    (trimmedRule.startsWith('[') || trimmedRule.startsWith('{')) &&
+    /\\[nrt"]/.test(trimmedRule)
+  ) {
+    candidates.push(unescapeDoubleEscapedJson(trimmedRule))
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (candidate.startsWith('[')) {
+        const parsed = JSON.parse(normalizeRelaxedExploreJson(candidate))
+        if (Array.isArray(parsed)) {
+          return parsed
+            .map((item) => ({
+              title: String(item?.title || '').trim(),
+              url: String(item?.url || '').trim(),
+            }))
+            .filter((item) => item.title)
+        }
       }
+    } catch {
+      // Try the next candidate, then fall back to the plain text parser below.
     }
-  } catch {
-    // Fall back to the plain text parser below.
   }
 
   return trimmedRule
@@ -47,9 +61,22 @@ export function parseExploreCategories(rule?: string | null): ExploreCategory[] 
     .filter(Boolean)
     .flatMap((line) => {
       if (!line.includes('::')) return []
+      // 解析不了的整段 JSON 不该被当成一个"分类"：一行以 [ / { 开头的超长
+      // 文本是 JSON 兜底产物，不是 title::url 规则，塞进导航栏只会出现一个
+      // 几千字符的巨型条目（看起来就是"分类栏只剩一项"）。
+      if ((line.startsWith('[') || line.startsWith('{')) && line.length > 128) return []
       const [title, url] = line.split('::').map((part) => part.trim())
       return title ? [{ title, url: url || '' }] : []
     })
+}
+
+function unescapeDoubleEscapedJson(rule: string): string {
+  return rule
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
 }
 
 function normalizeRelaxedExploreJson(rule: string) {
