@@ -4351,6 +4351,31 @@ fn parse_explore_kinds(
         }
     }
 
+    // 双转义恢复：个别导入链路会把 exploreUrl 里的换行/引号**再转义一次**，
+    // 存进来的 JSON 里全是字面 `\n`（反斜杠 + n 两个字符）—— 整段被压成一行
+    // 非法文本，上面的严格解析全部失败，最终落到 `::` 文本切分只会得到
+    // **一个**标题为整段 JSON 的巨型"分类"，发现页看起来就是"分类栏只剩一项"
+    // （实测：Cin漫 37 个分类只剩一个）。检测到「以 [ 或 { 开头 + 含字面转义
+    // 序列」时，先反转义一次再严格解析。
+    let trimmed_text = text.trim_start();
+    if (trimmed_text.starts_with('[') || trimmed_text.starts_with('{'))
+        && (text.contains("\\n") || text.contains("\\t") || text.contains("\\\""))
+    {
+        let unescaped = unescape_double_escaped_json(&text);
+        for json_text in [&unescaped, &normalize_relaxed_explore_json(&unescaped)] {
+            if let Ok(kinds) = serde_json::from_str::<Vec<ExploreKind>>(json_text.trim()) {
+                let mut kinds: Vec<ExploreKind> = kinds
+                    .into_iter()
+                    .filter(|kind| !kind.title.trim().is_empty())
+                    .collect();
+                if !kinds.is_empty() {
+                    resolve_explore_view_names(source, &mut kinds, info_map);
+                    return Ok(kinds);
+                }
+            }
+        }
+    }
+
     // 无前缀的裸 JS 对象字面量（这一类写法）：
     //   `[{'title':'我的书架','url':'...','style':{layout_flexGrow: 1}}, ...]`
     // 单引号 + 无引号键名，不是合法 JSON，`serde_json` 直接拒收。
@@ -4386,6 +4411,13 @@ fn parse_explore_kinds(
         .filter_map(|item| {
             let item = item.trim();
             if item.is_empty() {
+                return None;
+            }
+            // JSON 兜底产物不是 `标题::url` 规则：解析不了的整段 JSON 不该被
+            // 当成一个"分类"塞进导航栏 —— 那会让发现页出现一个几千字符的巨型
+            // 条目（看起来就是"分类栏只剩一项"）。跳过以 [ / { 开头的长文本，
+            // 让前端走「暂无分类」提示，问题至少不会被伪装成"只有一个分类"。
+            if (item.starts_with('[') || item.starts_with('{')) && item.len() > 128 {
                 return None;
             }
             let mut parts = item.splitn(2, "::");
@@ -4430,6 +4462,19 @@ fn resolve_explore_view_names(
             info_map,
         );
     }
+}
+
+/// 双转义恢复：把字面 `\n` `\r` `\t` `\"` 序列还原成真实字符。
+///
+/// 正常书源不会走到这里 —— 只在严格 JSON 解析失败后的恢复路径上调用。
+/// 已知导入链路（剪贴板中转、二次导出）会把 exploreUrl 里的换行再转义一次，
+/// 存进来的就是字面 `\n` 两个字符，整段 JSON 因此变成一行非法文本。
+fn unescape_double_escaped_json(text: &str) -> String {
+    text.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace("\\\"", "\"")
 }
 
 /// 把"宽松 JSON"（GSON 能读、`serde_json` 读不了）归一化到严格 JSON。
@@ -5108,6 +5153,61 @@ mod tests {
         assert_eq!(to_json(ContentLoadStage::Fetching), "\"fetching\"");
         assert_eq!(to_json(ContentLoadStage::Parsing), "\"parsing\"");
         assert_eq!(to_json(ContentLoadStage::Caching), "\"caching\"");
+    }
+
+    /// 双转义的 exploreUrl（导入链路二次转义：真实换行变成字面 `\n`）必须能
+    /// 恢复出全部分类。实测 Cin漫 37 个分类的 JSON 被二次转义后：严格解析
+    /// 失败、`::` 切分又切不开（没有真实换行），发现页只剩一个巨型"分类"。
+    #[test]
+    fn parse_explore_kinds_recovers_double_escaped_json() {
+        let inner = "[\n  {\"title\": \"总排行\", \"url\": \"https://a.example/{{page}}\"},\n  {\"title\": \"周排行\", \"url\": \"https://a.example/week\"}\n]";
+        // serde_json::to_string(&inner) 得到带外层引号的 JSON 字符串字面量，
+        // 去掉两端引号后，其内容正是"换行被再转义成字面 `\n`"的存储形态。
+        let escaped = serde_json::to_string(&inner).unwrap();
+        let double_escaped = escaped[1..escaped.len() - 1].to_string();
+        assert!(double_escaped.starts_with('['), "双转义样本应以 [ 开头");
+        assert!(double_escaped.contains("\\n"), "构造的双转义样本应含字面 \\n");
+        let source = BookSource {
+            explore_url: Some(double_escaped),
+            ..Default::default()
+        };
+
+        let kinds = parse_explore_kinds(&source, &HashMap::new()).unwrap();
+        assert_eq!(kinds.len(), 2, "双转义 JSON 应恢复出全部分类, 实际 {:?}", kinds);
+        assert_eq!(kinds[0].title, "总排行");
+        assert_eq!(kinds[0].url.as_deref(), Some("https://a.example/{{page}}"));
+        assert_eq!(kinds[1].title, "周排行");
+    }
+
+    /// 正常（未双转义）的多行 JSON 不受恢复逻辑影响。
+    #[test]
+    fn parse_explore_kinds_still_parses_plain_json() {
+        let source = BookSource {
+            explore_url: Some(
+                "[\n  {\"title\": \"🔖排行🔖\", \"url\": \"\"},\n  {\"title\": \"总排行\", \"url\": \"https://a.example/1\"}\n]"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let kinds = parse_explore_kinds(&source, &HashMap::new()).unwrap();
+        assert_eq!(kinds.len(), 2);
+        // 空 url 的分组标题原样保留（前端用它做分组分隔）。
+        assert_eq!(kinds[0].url.as_deref(), Some(""));
+    }
+
+    /// 解析不了的整段 JSON 不能被当成一个"分类"塞进导航栏 —— 否则发现页
+    /// 会出现一个几千字符的巨型条目，把真正的解析故障伪装成"只剩一个分类"。
+    #[test]
+    fn parse_explore_kinds_never_emits_giant_json_blob_as_category() {
+        let blob = format!("[{}]", "x".repeat(300));
+        let source = BookSource {
+            explore_url: Some(blob),
+            ..Default::default()
+        };
+
+        let kinds = parse_explore_kinds(&source, &HashMap::new()).unwrap();
+        assert!(kinds.is_empty(), "巨型 JSON 块不应被当作分类: {:?}", kinds);
     }
 
     /// 书架落盘必须原子替换: 并发读者永远看不到半截 JSON。

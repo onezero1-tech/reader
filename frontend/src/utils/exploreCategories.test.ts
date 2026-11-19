@@ -62,6 +62,36 @@ describe('exploreCategories', () => {
     ])
     expect(getInitialExploreCategoryUrl(categories)).toBe('/book/category/catalog.html')
   })
+
+  it('recovers double-escaped explore json (newlines stored as literal \\n)', () => {
+    // 导入链路二次转义的存储形态：真实换行/引号全部变成字面 \n 与 \"。
+    const inner = JSON.stringify(
+      [
+        { title: '🔖排行🔖', url: '' },
+        { title: '总排行', url: 'https://a.example/{{page}}/popular' },
+        { title: '周排行', url: 'https://a.example/popular-weekly' },
+      ],
+      null,
+      2,
+    )
+    const doubleEscaped = JSON.stringify(inner).slice(1, -1)
+
+    const categories = parseExploreCategories(doubleEscaped)
+    expect(categories).toEqual([
+      { title: '🔖排行🔖', url: '' },
+      { title: '总排行', url: 'https://a.example/{{page}}/popular' },
+      { title: '周排行', url: 'https://a.example/popular-weekly' },
+    ])
+    expect(getInitialExploreCategoryUrl(categories)).toBe('https://a.example/{{page}}/popular')
+  })
+
+  it('never emits an unparseable json blob as a single giant category', () => {
+    // JSON 解析失败时，整段 blob 会落到文本切分兜底；没有真实换行时它就是
+    // "一行"，没有守卫的话会被当成一个标题为几千字符的巨型"分类"。
+    const blob = '[' + 'x'.repeat(300) + ']::https://a.example/1'
+    const categories = parseExploreCategories(blob)
+    expect(categories).toEqual([])
+  })
 })
 
 describe('isJsExploreUrl', () => {
