@@ -103,8 +103,11 @@ export function parseSourceImageOptions(rawSrc: string): SourceImageOption | nul
  *  实测(700px 列宽): 只写 aspect-ratio 时加载前高度 0; 加上 width:100% 后
  *  加载前后都是 393.75px, 位移 0。
  *
- *  比例取常见横图 16:9。真实图片比例不同, 加载后由 `height: auto` 与图片
- *  自身比例接管 —— 这一层只负责「先把位置占住」。 */
+ *  占位比例取常见横图 16:9。**加载完成后必须把 `aspect-ratio` 换成图片固有
+ *  比例** —— 显式 `aspect-ratio` 的优先级高于固有尺寸, 若一直留着 16:9,
+ *  元素盒子就被钉死成横条, 竖版漫画页的位图被压进横条里显示(拉伸变形)。
+ *  换成固有比例后, 高度仍由 `height: auto` 按列宽换算, 图片随窗口/列宽
+ *  等比缩放, 不变形。 */
 const FALLBACK_IMAGE_ASPECT = '16 / 9'
 
 export function reserveImageSpace(root: HTMLElement) {
@@ -116,6 +119,18 @@ export function reserveImageSpace(root: HTMLElement) {
     image.style.width = '100%'
     image.style.aspectRatio = FALLBACK_IMAGE_ASPECT
     image.style.height = 'auto'
+    // 加载完成后用固有比例替换 16:9 占位(见上方注释)。缓存命中时 load 事件
+    // 不会再触发, 所以 complete 为真时同步结算一次。
+    const settle = () => {
+      if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+        image.style.aspectRatio = `${image.naturalWidth} / ${image.naturalHeight}`
+      }
+    }
+    if (image.complete) {
+      settle()
+    } else {
+      image.addEventListener('load', settle, { once: true })
+    }
   })
 }
 
