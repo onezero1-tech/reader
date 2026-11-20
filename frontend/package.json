@@ -12,6 +12,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2",
     "echarts": "^6.1.0",
+    "hls.js": "^1.7.4",
     "opencc-js": "^1.4.2",
     "pdfjs-dist": "^5.7.284",
     "pinia": "^3.0.4",

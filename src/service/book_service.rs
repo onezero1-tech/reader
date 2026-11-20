@@ -4352,6 +4352,145 @@ impl BookService {
         Ok((bytes, content_type))
     }
 
+    /// 视频源正文: 拉取媒体地址并按需改写 m3u8 播放列表。
+    ///
+    /// 视频书源(legado `bookSourceType=4`)的 ruleContent 返回的是**播放地址**
+    /// (m3u8/mp4), 不是正文文本。前端 `<video>` 直接加载远程地址时同样无法
+    /// 携带书源 headers —— 有防盗链的 CDN 不带站内 Referer 一律 403 —— 因此
+    /// 播放器统一走 `/media` 代理。
+    ///
+    /// m3u8 播放列表里的分片地址绝大多数是**相对路径**，hls.js 会按播放列表
+    /// 响应 URL 去解析，落到代理路径上就全错了。这里在回传前把每个分片/密钥
+    /// URI 解析成绝对地址、再包一层 `/media?path=...&source=...`，后续分片
+    /// 请求便继续走同一代理（`source` 参数让代理能反查书源 headers）。
+    ///
+    /// 播放地址带签名与时效（`?t=..&sign=..`），**绝不缓存**：既不写盘也不进
+    /// 内存缓存，列表每次重新拉取。
+    pub async fn get_media_for_source(
+        &self,
+        user_ns: &str,
+        raw_url: &str,
+        source: Option<&BookSource>,
+        range_header: Option<&str>,
+    ) -> Result<MediaPayload, AppError> {
+        let raw_url = raw_url.trim();
+
+        // 与正文图片同一套 `analyze_url` 语义: 地址里可能带 `,{json}` 请求选项,
+        // 选项 headers 与书源级 header 合并, UA 缺省时补默认值。
+        let spec = match source {
+            Some(source) => {
+                let raw = raw_url.to_string();
+                let base = source.book_source_url.clone();
+                self.run_source_task(user_ns, source, move |source| {
+                    analyze_url(&raw, "", 1, &base, source)
+                })
+                .await?
+                .map_err(|err| AppError::BadRequest(format!("媒体地址解析失败: {err}")))?
+            }
+            None => analyze_url(raw_url, "", 1, raw_url, &BookSource::default())
+                .map_err(|err| AppError::BadRequest(format!("媒体地址解析失败: {err}")))?,
+        };
+
+        let source_url = source
+            .map(|s| s.book_source_url.clone())
+            .unwrap_or_default();
+        let context = self
+            .http
+            .source_context(user_ns, &source_url, None)
+            .map_err(AppError::Internal)?;
+        let build_request = |client: &reqwest::Client| {
+            let mut req = client.get(&spec.url);
+            for (name, value) in &spec.headers {
+                if let (Ok(name), Ok(value)) = (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(value),
+                ) {
+                    req = req.header(name, value);
+                }
+            }
+            if let Some(range) = range_header.filter(|v| !v.trim().is_empty()) {
+                if let Ok(value) = reqwest::header::HeaderValue::from_str(range.trim()) {
+                    req = req.header(reqwest::header::RANGE, value);
+                }
+            }
+            // 视频分片(TS/fMP4)本身不可再压缩, 而 reqwest 开了 gzip/brotli
+            // 会自动带 Accept-Encoding —— 实测一类 CDN(Byte-nginx)对 HTTP/2
+            // 压缩大文件会中途重置流(reqwest 报 "error decoding response
+            // body")。显式声明 identity 既绕开该缺陷, 也省一次无谓的解压。
+            req = req.header(
+                reqwest::header::ACCEPT_ENCODING,
+                reqwest::header::HeaderValue::from_static("identity"),
+            );
+            req
+        };
+        let mut res = build_request(&context.client).send().await;
+        let retry_status = match &res {
+            Ok(response) => Some(response.status().as_u16()),
+            Err(_) => None,
+        };
+        if cover_needs_direct_retry(context.proxy.is_some(), retry_status) {
+            if let Ok(direct) = self.http.source_context_direct(user_ns, &source_url) {
+                if let Ok(direct_res) = build_request(&direct.client).send().await {
+                    if direct_res.status().is_success() {
+                        tracing::info!(url = %spec.url, "proxy media request blocked; used direct retry");
+                        res = Ok(direct_res);
+                    }
+                }
+            }
+        }
+        let res = res.map_err(|e| AppError::Internal(e.into()))?;
+        let status = res.status().as_u16();
+        let upstream_content_type = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let content_range = res
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let accept_ranges = res
+            .headers()
+            .get(reqwest::header::ACCEPT_RANGES)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let base_url = res.url().to_string();
+        let bytes = res
+            .bytes()
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?
+            .to_vec();
+
+        let is_playlist = media_url_is_playlist(&spec.url, upstream_content_type.as_deref(), &bytes);
+        if !(200..300).contains(&status) {
+            return Err(AppError::NotFound(format!("media fetch failed: {status}")));
+        }
+        if !is_playlist {
+            return Ok(MediaPayload {
+                bytes,
+                content_type: upstream_content_type
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                status,
+                content_range,
+                accept_ranges,
+                is_playlist: false,
+            });
+        }
+        // 分片路径必然不是 .m3u8, 这里统一当成播放列表; 扩展名异常的站点靠
+        // `#EXTM3U` 魔数兜底识别。
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let rewritten = rewrite_m3u8_playlist(&text, &base_url, &source_url);
+        Ok(MediaPayload {
+            bytes: rewritten.into_bytes(),
+            content_type: "application/vnd.apple.mpegurl".to_string(),
+            status,
+            content_range: None,
+            accept_ranges: None,
+            is_playlist: true,
+        })
+    }
+
     /// 缓存命中时的解密补救。
     ///
     /// 修复前落盘的封面是**密文**（解密逻辑此前不存在），映射里记的
@@ -5629,6 +5768,135 @@ fn sniff_image_content_type(bytes: &[u8]) -> Option<String> {
     Some(mime.to_string())
 }
 
+/// `/media` 代理的回传载荷。
+#[derive(Debug, Clone)]
+pub struct MediaPayload {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    /// 上游状态码(206 分片 Range 请求需要原样回传)。
+    pub status: u16,
+    pub content_range: Option<String>,
+    pub accept_ranges: Option<String>,
+    /// true = 播放列表(已改写分片地址), false = 媒体分片/文件字节。
+    pub is_playlist: bool,
+}
+
+/// 判断媒体响应是否为 m3u8 播放列表。
+///
+/// 三个判据按可靠性排序: URL 后缀 → Content-Type → `#EXTM3U` 魔数。
+/// 一类站点的分片地址不带 `.m3u8` 后缀(如 `…/manifest.m3u8?t=..&sign=..`
+/// 倒是带的), 但也有把播放列表发成 `application/octet-stream` 的, 魔数兜底。
+fn media_url_is_playlist(url: &str, content_type: Option<&str>, body: &[u8]) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".m3u8") {
+        return true;
+    }
+    if let Some(ct) = content_type {
+        let ct = ct.to_ascii_lowercase();
+        if ct.contains("mpegurl") {
+            return true;
+        }
+        // 明确的二进制媒体类型说明不是播放列表, 不必再看魔数。
+        if ct.starts_with("video/") || ct.starts_with("audio/") || ct.starts_with("image/") {
+            return false;
+        }
+    }
+    let first_non_ws = body
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    body[first_non_ws..].starts_with(b"#EXTM3U")
+}
+
+/// 把目标地址解析成相对 `base` 的绝对地址。
+///
+/// m3u8 分片常见三种写法: 绝对地址、`//host/path`(协议相对)、`/path`(根相对),
+/// 以及纯相对路径。播放列表一般没有 `./`/`../`, 不做逐段归并。
+fn resolve_media_url(base: &str, target: &str) -> Option<String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Some(target.to_string());
+    }
+    if let Some(rest) = target.strip_prefix("//") {
+        let scheme = base.split("://").next().unwrap_or("https");
+        return Some(format!("{scheme}://{rest}"));
+    }
+    let base_path = base.split(['?', '#']).next().unwrap_or(base);
+    if target.starts_with('/') {
+        let scheme_end = base.find("://")? + 3;
+        let host_end = base[scheme_end..]
+            .find('/')
+            .map(|i| scheme_end + i)
+            .unwrap_or(base.len());
+        return Some(format!("{}{}", &base[..host_end], target));
+    }
+    let dir = base_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(base_path);
+    Some(format!("{dir}/{target}"))
+}
+
+/// 构造 `/media` 代理链接(相对路径, 由播放器按播放列表响应 URL 解析)。
+fn media_proxy_link(target: &str, source_url: &str) -> String {
+    let mut link = format!("/media?path={}", percent_encode(target));
+    if !source_url.is_empty() {
+        link.push_str(&format!("&source={}", percent_encode(source_url)));
+    }
+    link
+}
+
+/// 百分号编码(query 值安全字符之外全部转义)。
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// 改写 m3u8 播放列表: 所有 URI(分片行 + `#EXT-X-KEY`/`#EXT-X-MAP`/
+/// `#EXT-X-SESSION-KEY` 的 `URI="…"` 属性)都包一层 `/media` 代理。
+fn rewrite_m3u8_playlist(body: &str, base_url: &str, source_url: &str) -> String {
+    let uri_attr = Regex::new(r#"(URI\s*=\s*)("([^"]*)"|'([^']*)')"#).expect("valid regex");
+    let mut out = String::with_capacity(body.len() * 2);
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            // 标签行: 只改写 URI="..." / URI='...' 属性(密钥、初始化段)。
+            let rewritten = uri_attr.replace_all(trimmed, |caps: &regex::Captures| {
+                let value = caps
+                    .get(3)
+                    .or_else(|| caps.get(4))
+                    .map(|m| m.as_str())
+                    .unwrap_or_default();
+                let quoted = if caps.get(3).is_some() { '"' } else { '\'' };
+                match resolve_media_url(base_url, value) {
+                    Some(abs) => format!("{}{}{}{}", &caps[1], quoted, media_proxy_link(&abs, source_url), quoted),
+                    None => caps[0].to_string(),
+                }
+            });
+            out.push_str(&rewritten);
+        } else {
+            match resolve_media_url(base_url, trimmed) {
+                Some(abs) => out.push_str(&media_proxy_link(&abs, source_url)),
+                None => out.push_str(trimmed),
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// 封面落盘用的扩展名。
 ///
 /// 以服务端给的 `Content-Type` 为准: 一类图床的地址形如 `…:1200:0.image`,
@@ -5840,6 +6108,119 @@ mod tests {
         assert_eq!(to_json(ContentLoadStage::Fetching), "\"fetching\"");
         assert_eq!(to_json(ContentLoadStage::Parsing), "\"parsing\"");
         assert_eq!(to_json(ContentLoadStage::Caching), "\"caching\"");
+    }
+
+    /// 视频源 m3u8 改写: 分片与密钥 URI 都要包进 `/media` 代理,
+    /// 相对地址按播放列表 URL(含重定向后的最终地址)解析成绝对地址。
+    #[test]
+    fn rewrite_m3u8_wraps_segment_and_key_uris_with_proxy() {
+        let playlist = "#EXTM3U\n\
+                        #EXT-X-VERSION:3\n\
+                        #EXT-X-KEY:METHOD=AES-128,URI=\"/api/v1/cdn/key/abc\",IV=0x1234\n\
+                        #EXT-X-TARGETDURATION:10\n\
+                        https://cdn.example.com/seg0.ts\n\
+                        seg1.ts\n\
+                        #EXT-X-ENDLIST\n";
+        let base = "https://liz04.com/api/v1/cdn/video/x/manifest.m3u8?t=1&sign=a";
+        let out = rewrite_m3u8_playlist(playlist, base, "https://liz04.com");
+        let lines: Vec<&str> = out.lines().collect();
+
+        // 密钥 URI: 根相对 → 绝对 → 代理
+        assert!(
+            lines[2].contains("URI=\"/media?path=https%3A%2F%2Fliz04.com%2Fapi%2Fv1%2Fcdn%2Fkey%2Fabc&source=https%3A%2F%2Fliz04.com\""),
+            "密钥行应改写为代理地址: {}",
+            lines[2]
+        );
+        assert!(lines[2].contains("IV=0x1234"), "其余属性必须保留: {}", lines[2]);
+        // 绝对分片原样进入代理
+        assert!(lines[4].contains("path=https%3A%2F%2Fcdn.example.com%2Fseg0.ts"), "{}", lines[4]);
+        // 相对分片按播放列表所在目录解析
+        assert!(
+            lines[5].contains("path=https%3A%2F%2Fliz04.com%2Fapi%2Fv1%2Fcdn%2Fvideo%2Fx%2Fseg1.ts"),
+            "相对分片应按播放列表目录解析: {}",
+            lines[5]
+        );
+        // #EXTM3U 与普通标签不动
+        assert_eq!(lines[0], "#EXTM3U");
+        assert_eq!(lines[3], "#EXT-X-TARGETDURATION:10");
+        assert_eq!(lines[6], "#EXT-X-ENDLIST");
+    }
+
+    /// 相对解析的三种形态: 协议相对、根相对、纯相对。
+    #[test]
+    fn resolve_media_url_covers_relative_forms() {
+        let base = "https://h.com/a/b/playlist.m3u8?t=1";
+        assert_eq!(
+            resolve_media_url(base, "https://o.com/x.ts").as_deref(),
+            Some("https://o.com/x.ts")
+        );
+        assert_eq!(
+            resolve_media_url(base, "//cdn.com/x.ts").as_deref(),
+            Some("https://cdn.com/x.ts")
+        );
+        assert_eq!(
+            resolve_media_url(base, "/abs/x.ts").as_deref(),
+            Some("https://h.com/abs/x.ts")
+        );
+        assert_eq!(
+            resolve_media_url(base, "x.ts").as_deref(),
+            Some("https://h.com/a/b/x.ts")
+        );
+        assert_eq!(resolve_media_url(base, "").is_none(), true);
+    }
+
+    /// 播放列表判定: 后缀、Content-Type、魔数三条路径都要命中;
+    /// 明确的 video/* 类型不能被误判成列表。
+    #[test]
+    fn media_url_is_playlist_matches_by_suffix_type_and_magic() {
+        let body = b"#EXTM3U\n#EXT-X-ENDLIST\n";
+        assert!(media_url_is_playlist(
+            "https://h.com/manifest.m3u8?t=1&sign=a",
+            Some("application/octet-stream"),
+            body
+        ));
+        assert!(media_url_is_playlist(
+            "https://h.com/video/manifest",
+            Some("application/vnd.apple.mpegurl"),
+            body
+        ));
+        assert!(media_url_is_playlist(
+            "https://h.com/weird/seg",
+            Some("application/octet-stream"),
+            body
+        ));
+        // 魔数判定按首字节; 前导二进制垃圾不是播放列表。
+        assert!(!media_url_is_playlist(
+            "https://h.com/weird/seg",
+            Some("application/octet-stream"),
+            b"\x00\x01\x02\x03"
+        ));
+        assert!(!media_url_is_playlist(
+            "https://h.com/seg0.ts",
+            Some("video/mp2t"),
+            b"\x47\x40\x01\x00"
+        ));
+    }
+
+    /// 空行保留、引号形式 URI='...' 也能改写。
+    #[test]
+    fn rewrite_m3u8_keeps_blank_lines_and_single_quotes() {
+        let playlist = "#EXT-X-MAP:URI='init.mp4'\n\nseg0.ts\n";
+        let base = "https://h.com/v/list.m3u8";
+        let out = rewrite_m3u8_playlist(playlist, base, "");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "空行必须保留, 实际: {out:?}");
+        assert!(
+            lines[0].contains("URI='/media?path=https%3A%2F%2Fh.com%2Fv%2Finit.mp4'"),
+            "单引号形式应改写: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("source=") == false,
+            "source 为空时不附加 source 参数: {}",
+            lines[0]
+        );
+        assert_eq!(lines[1], "");
     }
 
     /// 双转义的 exploreUrl（导入链路二次转义：真实换行变成字面 `\n`）必须能

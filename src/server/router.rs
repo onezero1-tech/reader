@@ -25,7 +25,7 @@ use crate::service::local_txt_book::MAX_TXT_UPLOAD_BYTES;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Multipart, State},
-    http::{StatusCode, Uri},
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -151,6 +151,7 @@ pub fn build(state: AppState, _options: WebOptions, static_source: Option<Static
         // ─── 资源 ───
         .route("/cover", get(cover))
         .route("/img", get(img))
+        .route("/media", get(media))
         .route("/pdf", get(pdf))
         .route("/epub", get(epub))
         .route("/files", get(files))
@@ -610,6 +611,17 @@ async fn cover(State(state): State<AppState>, uri: Uri) -> Response {
 
 async fn img(State(state): State<AppState>, uri: Uri) -> Response {
     from_tauri_response(crate::api::protocol::img_route(&state, &query_string(&uri)).await)
+}
+
+async fn media(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok());
+    from_tauri_response(crate::api::protocol::media_route(&state, &query_string(&uri), range).await)
 }
 
 async fn pdf(State(state): State<AppState>, uri: Uri) -> Response {

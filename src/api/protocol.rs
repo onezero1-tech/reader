@@ -59,6 +59,15 @@ async fn route(
         "/sourcePanel" => source_panel_route(state, query, &request).await,
         "/cover" => cover_route(state, query).await,
         "/img" => img_route(state, query).await,
+        "/media" => media_route(
+            state,
+            query,
+            request
+                .headers()
+                .get(http::header::RANGE)
+                .and_then(|v| v.to_str().ok()),
+        )
+        .await,
         "/epub" => epub_route(state, query).await,
         "/pdf" => pdf_route(state, query).await,
         "/files" => files_route(state, query).await,
@@ -757,6 +766,78 @@ pub async fn img_route(state: &AppState, query: &str) -> tauri::http::Response<V
                 cache.insert(cache_key, (bytes.clone(), content_type.clone()));
             }
             bytes_response(bytes, &content_type, Some("86400"))
+        }
+        Err(_) => http::Response::builder()
+            .status(404)
+            .body(Vec::new())
+            .unwrap_or_default(),
+    }
+}
+
+/// 媒体代理: `/media?path=<播放地址>&source=<bookSourceUrl>`。
+///
+/// 视频书源(legado `bookSourceType=4`)的 ruleContent 返回播放地址而不是文本,
+/// 前端播放器把该地址包成本代理来加载 —— 与 `/img` 同理, WebView 直接请求
+/// 远程媒体拿不到书源 headers(Referer/UA/Cookie), 有防盗链的 CDN 直接 403。
+///
+/// m3u8 播放列表在 `book_service::get_media_for_source` 里已把分片/密钥 URI
+/// 改写成相对的 `/media?path=...` 链接, 后续分片请求继续落到本路由。
+/// 播放地址带签名时效, 一律 `no-store`, 不进任何缓存。
+pub async fn media_route(
+    state: &AppState,
+    query: &str,
+    range_header: Option<&str>,
+) -> tauri::http::Response<Vec<u8>> {
+    let params: HashMap<String, String> =
+        serde_urlencoded::from_str(query).unwrap_or_default();
+    let url = params.get("path").map(String::as_str).unwrap_or_default();
+    if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return http::Response::builder()
+            .status(404)
+            .body(Vec::new())
+            .unwrap_or_default();
+    }
+    let range = range_header.map(str::to_string);
+
+    let source = resolve_cover_source(state, params.get("source").map(String::as_str), url).await;
+
+    match state
+        .book_service
+        .get_media_for_source("public", url, source.as_ref(), range.as_deref())
+        .await
+    {
+        Ok(payload) => {
+            let status = if payload.status == 206 {
+                206
+            } else {
+                200
+            };
+            let mut builder = http::Response::builder().status(status);
+            if let Ok(value) = http::HeaderValue::from_str(&payload.content_type) {
+                builder = builder.header(http::header::CONTENT_TYPE, value);
+            }
+            if let Some(range_value) = &payload.content_range {
+                if let Ok(value) = http::HeaderValue::from_str(range_value) {
+                    builder = builder.header(http::header::CONTENT_RANGE, value);
+                }
+            }
+            if let Some(accept) = &payload.accept_ranges {
+                if let Ok(value) = http::HeaderValue::from_str(accept) {
+                    builder = builder.header(http::header::ACCEPT_RANGES, value);
+                }
+            }
+            // 播放列表: 地址带签名时效, 必须每次重新拉; 分片字节跟随上游语义。
+            let cache_control = if payload.is_playlist {
+                "no-store"
+            } else {
+                "max-age=86400"
+            };
+            builder
+                .header(http::header::CACHE_CONTROL, cache_control)
+                .header("access-control-allow-origin", "*")
+                .header("cross-origin-resource-policy", "cross-origin")
+                .body(payload.bytes)
+                .unwrap_or_else(|_| http::Response::new(Vec::new()))
         }
         Err(_) => http::Response::builder()
             .status(404)

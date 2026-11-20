@@ -192,8 +192,35 @@
         {{ offlineBannerText }}
       </div>
 
+      <!-- 视频源章节: 播放器替代文本渲染, 章节导航沿用原机制 -->
+      <div
+        v-if="!showChapterLoading && !store.bookLoadError && mediaChapter"
+        class="media-chapter"
+        :style="{ maxWidth: config.pageWidth + 'px' }"
+      >
+        <div class="chapter-title">{{ store.displayChapterTitle || '加载中...' }}</div>
+        <VideoPlayer
+          :src="mediaChapterSrc"
+          :kind="mediaChapter.kind"
+          @ended="onMediaEnded"
+          @reload="reloadMediaChapter"
+        />
+        <div class="chapter-footer media-footer">
+          <button
+            class="next-btn"
+            :disabled="store.currentIndex <= 0 || store.loading"
+            @click="prevChapterFromContextMenu"
+          >上一集</button>
+          <button
+            class="next-btn"
+            :disabled="!store.hasNext || store.loading"
+            @click="nextChapterFromContextMenu"
+          >下一集</button>
+        </div>
+      </div>
+
       <article
-        v-if="!showChapterLoading && !store.bookLoadError && !isContinuousMode"
+        v-if="!showChapterLoading && !store.bookLoadError && !isContinuousMode && !mediaChapter"
         class="chapter-content"
         :class="{ 'horizontal-page-article': isHorizontalPageMode }"
         :style="{
@@ -477,6 +504,7 @@ import { PDF_PAGE_ATTR, isPdfBook, releasePdfBook, renderPdfChapterPages } from 
 import { rewriteCssAssetUrls, toReaderAssetUrl } from '../utils/localEpubAsset'
 import { readerWindowBackground as composeReaderWindowBackground } from '../utils/readerBackground'
 import { processSourceImageOptions, reserveImageSpace, settleImageAspectRatio } from '../utils/sourceImageOptions'
+import { detectMediaContent, mediaProxyUrl } from '../utils/mediaContent'
 import { repairSourceImageHtml } from '../utils/sourceImageHtml'
 import { handleReaderFontSizeWheel } from '../utils/readerFontSize'
 import { createReaderProgressAutoSaveScheduler, createReaderProgressExitSaver } from '../utils/readerProgressAutoSave'
@@ -511,6 +539,7 @@ import {
 import type { Book } from '../types'
 
 import ReaderMobileControls from '../components/reader/ReaderMobileControls.vue'
+import VideoPlayer from '../components/reader/VideoPlayer.vue'
 import SourceBrowserPanel from '../components/SourceBrowserPanel.vue'
 import { useReaderSearch, type SearchLocateOptions } from '../composables/useReaderSearch'
 import { useReaderSelection } from '../composables/useReaderSelection'
@@ -884,6 +913,26 @@ const readerProgressExitSaver = createReaderProgressExitSaver({
 })
 const isPdfBookMode = computed(() => isPdfBook(store.book))
 /**
+ * 视频源章节: ruleContent 返回的是播放地址(m3u8/mp4), 不是正文文本。
+ * 旧版把地址当文本渲染, 用户点开一集只看到一行裸 http 链接。识别出媒体
+ * 地址后交给 VideoPlayer 播放(经 /media 代理携带书源 headers), 章节导航
+ * (上一集/下一集)与进度记录沿用原有的章节切换机制。
+ *
+ * 与本地 PDF 同一原则: 不参与左右翻页/连续阅读等文本排版模式。
+ */
+const mediaChapter = computed(() => detectMediaContent(store.content))
+const mediaChapterSrc = computed(() =>
+  mediaChapter.value ? mediaProxyUrl(mediaChapter.value.url, store.book?.origin || '') : ''
+)
+/** 签名播放地址有时效, 网络层 403 时自动刷新正文重取一次; 只重试一次防死循环。 */
+const mediaChapterReloadCount = ref(0)
+watch(
+  () => store.currentIndex,
+  () => {
+    mediaChapterReloadCount.value = 0
+  }
+)
+/**
  * 本地 PDF 走「逐页 canvas」渲染, 既不参与按字号重排的左右翻页 (那会把一张
  * 整页图切成几块), 也不进连续阅读: 那里的正文分散在多章块里, 而页渲染与
  * 释放都是按单章做的 —— 一章一屏才能保证换章时把上一章的 canvas 全部回收。
@@ -891,13 +940,14 @@ const isPdfBookMode = computed(() => isPdfBook(store.book))
 const isContinuousMode = computed(
   () =>
     !isPdfBookMode.value &&
+    !mediaChapter.value &&
     (config.value.readMethod === '上下滚动' || config.value.readMethod === '上下滚动2'),
 )
 const hideReadChaptersMode = computed(
   () => !isPdfBookMode.value && config.value.readMethod === '上下滚动2',
 )
 const isHorizontalPageMode = computed(
-  () => config.value.readMethod === '左右翻页' && !isPdfBookMode.value,
+  () => config.value.readMethod === '左右翻页' && !isPdfBookMode.value && !mediaChapter.value,
 )
 /** 自动阅读状态条上的方式说明: 左右分页是逐页翻, 其余是连续滚动。 */
 const autoReadingModeLabel = computed(() => (isHorizontalPageMode.value ? '翻页' : '平滑'))
@@ -3002,6 +3052,18 @@ async function nextChapterFromContextMenu() {
   await nextChapter()
 }
 
+/** 视频源: 网络层致命错误(签名地址过期 403 等) → 强刷正文拿新地址, 只自动重试一次。 */
+async function reloadMediaChapter() {
+  if (mediaChapterReloadCount.value >= 1 || store.loading) return
+  mediaChapterReloadCount.value++
+  await store.loadChapter(store.currentIndex, true)
+}
+
+/** 视频源: 一集播完自动连播下一集(短剧的典型使用方式)。 */
+async function onMediaEnded() {
+  if (store.hasNext && !store.loading) await nextChapter()
+}
+
 function closeReaderContextMenu() {
   readerContextMenu.value.visible = false
 }
@@ -4691,6 +4753,20 @@ watch(
   padding: 80px 24px;
   min-height: 100%;
   transition: all 0.3s ease;
+}
+
+/* 视频源章节: 沿用正文的容器节奏, 播放器 16:9 自适应容器宽度。 */
+.media-chapter {
+  margin: 0 auto;
+  padding: 80px 24px;
+  min-height: 100%;
+  width: 100%;
+}
+
+.media-footer {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
 }
 
 .chapter-content.horizontal-page-article {
