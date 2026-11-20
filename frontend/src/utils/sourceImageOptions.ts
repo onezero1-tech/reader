@@ -119,19 +119,45 @@ export function reserveImageSpace(root: HTMLElement) {
     image.style.width = '100%'
     image.style.aspectRatio = FALLBACK_IMAGE_ASPECT
     image.style.height = 'auto'
+    // 标记这是阅读器自置的占位比例: 结算(settleImageAspectRatio)只改写
+    // 带标记的图片, 书源自己写的 aspect-ratio(可能刻意裁切)不动。
+    // dataset 会随 innerHTML 一起序列化, 渲染后的 <img> 仍带着标记。
+    image.dataset.readerAspectFallback = '1'
     // 加载完成后用固有比例替换 16:9 占位(见上方注释)。缓存命中时 load 事件
     // 不会再触发, 所以 complete 为真时同步结算一次。
-    const settle = () => {
-      if (image.naturalWidth > 0 && image.naturalHeight > 0) {
-        image.style.aspectRatio = `${image.naturalWidth} / ${image.naturalHeight}`
-      }
-    }
-    if (image.complete) {
-      settle()
-    } else {
-      image.addEventListener('load', settle, { once: true })
+    settleImageAspectRatio(image)
+    if (!image.complete) {
+      image.addEventListener('load', () => settleImageAspectRatio(image), { once: true })
     }
   })
+}
+
+/** 把图片的占位宽高比换成已解码的固有比例。
+ *
+ *  `reserveImageSpace` 在**游离 DOM**(formatChapterHtml 的 wrapper)上绑定 load
+ *  监听, 而 v-html 渲染出的是**重新解析**出来的另一批 `<img>` —— 监听器随
+ *  wrapper 一起被丢弃, 渲染出来的图片加载完成后没有任何人结算比例, 16:9 占位
+ *  就一直钉在元素上: 竖版漫画页被压进横条里显示(拉伸变形)。
+ *
+ *  这里做成独立函数, 由阅读页的 `@load.capture` 委托(load 不冒泡, capture 才
+ *  能在容器上收到)对**渲染后**的图片调用。只改写带 `readerAspectFallback`
+ *  标记(即阅读器自置的 16:9 占位)的图片: 书源自己写的比例不动。
+ */
+export function settleImageAspectRatio(image: HTMLImageElement): void {
+  if (!(image.naturalWidth > 0) || !(image.naturalHeight > 0)) return
+  // 只结算阅读器自置的 16:9 占位: 书源自己写的宽高比(可能刻意裁切)保持原样。
+  if (image.dataset.readerAspectFallback !== '1') return
+  // 有 width/height 属性的图片按属性推导比例, 不需要(也不该)内联结算。
+  if (image.hasAttribute('width') && image.hasAttribute('height')) return
+  const current = image.style.aspectRatio
+  if (!current) return
+  const [currentWidth, currentHeight] = current.split('/').map((part) => parseFloat(part))
+  if (!(currentWidth > 0) || !(currentHeight > 0)) return
+  const currentRatio = currentWidth / currentHeight
+  const naturalRatio = image.naturalWidth / image.naturalHeight
+  // 1% 容差: 只结算 16:9 这类占位值, 浮点噪声不触发改写。
+  if (Math.abs(currentRatio - naturalRatio) / naturalRatio <= 0.01) return
+  image.style.aspectRatio = `${image.naturalWidth} / ${image.naturalHeight}`
 }
 
 /**

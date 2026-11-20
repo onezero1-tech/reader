@@ -194,3 +194,63 @@ async fn content_rule_business_error_is_reported_to_the_user() {
     assert!(!message.contains("正文解析为空"), "不应退化成泛化提示: {message}");
     server.abort();
 }
+
+/// 复现「Cin漫画」一类接口源: `ruleSearch.bookUrl` 写单花括号 JSONPath 模板
+/// `https://cin.onl/v/{$.id}`。
+///
+/// 此前模板原样留在 bookUrl 里, 连带三处故障:
+///   1. 目录抓取请求字面量 `https://cin.onl/v/{$.id}` → 0 章 →「目录为空」;
+///   2. 正文规则 `result.match(...)[0]` 在空页面上抛 cannot read property of null;
+///   3. 探索/搜索每本书 bookUrl 相同, 前端按 bookUrl 去重后整页只剩一本。
+#[test]
+fn single_brace_jsonpath_template_in_book_url_is_expanded_per_item() {
+    let source = book_source_from_value(json!({
+        "bookSourceUrl":"https://cin.onl", "bookSourceName":"Cin漫画", "bookSourceType":2,
+        "ruleSearch":{
+            "bookList":"$.result",
+            "name":"$.title.pretty",
+            "bookUrl":"https://cin.onl/v/{$.id}",
+            "coverUrl":"$.cover.t"
+        },
+        "ruleExplore": {}
+    })).unwrap();
+    let body = json!({"result":[
+        {"id":"abc123","title":{"pretty":"作品一"},"cover":{"t":"https://cin.onl/covers/a.webp"}},
+        {"id":"def456","title":{"pretty":"作品二"},"cover":{"t":"https://cin.onl/covers/b.webp"}}
+    ]}).to_string();
+    let engine = RuleEngine::new().unwrap();
+
+    let books = engine.search_books(&source, &body, "https://cin.onl");
+    assert_eq!(books.len(), 2, "两本书都要解析出来");
+    assert_eq!(books[0].book_url, "https://cin.onl/v/abc123");
+    assert_eq!(books[1].book_url, "https://cin.onl/v/def456");
+    // 模板展开后每本书地址互不相同, 前端按 bookUrl 去重才不会只剩一本
+    assert_ne!(books[0].book_url, books[1].book_url);
+
+    // ruleExplore 整个为空时回退 ruleSearch, 探索页同样要展开模板
+    let explore = engine.explore_books(&source, &body, "https://cin.onl");
+    assert_eq!(explore.len(), 2);
+    assert_eq!(explore[0].book_url, "https://cin.onl/v/abc123");
+    assert_eq!(explore[1].book_url, "https://cin.onl/v/def456");
+}
+
+/// 模板取不到字段时保持原样(不吞数据); 双花括号 `{{...}}` 模板不能被误伤。
+#[test]
+fn single_brace_template_fallbacks_and_double_brace_untouched() {
+    let item = json!({"name":"示例书", "id":42});
+    let source = book_source_from_value(json!({
+        "bookSourceUrl":"https://example.test", "bookSourceName":"T",
+        "ruleSearch":{
+            "bookList":"$.list",
+            "name":"$.name",
+            "bookUrl":"https://example.test/b/{$.id}/name={{$.name}}/missing={$Missing}"
+        }
+    })).unwrap();
+    let body = json!({"list":[item.clone(), {"name":"无ID的书"}]}).to_string();
+    let books = RuleEngine::new().unwrap().search_books(&source, &body, "https://example.test");
+    assert_eq!(books.len(), 2);
+    // 数字字段同样展开; 双花括号 `{{$.name}}` 走原有语义不受影响
+    assert_eq!(books[0].book_url, "https://example.test/b/42/name=示例书/missing={$Missing}");
+    // 字段缺失时保留原样, 不拼出错误 URL
+    assert_eq!(books[1].book_url, "https://example.test/b/{$.id}/name=无ID的书/missing={$Missing}");
+}

@@ -5,6 +5,7 @@ import {
   parseSourceImageOptions,
   processSourceImageOptions,
   reserveImageSpace,
+  settleImageAspectRatio,
 } from './sourceImageOptions'
 
 // 取自真实插件(addComment)产生的 src: 段评图标 + 配置面板 click
@@ -210,9 +211,11 @@ describe('reserveImageSpace（用最小 DOM 桩，不依赖 jsdom）', () => {
     const attrs = new Map<string, string>(Object.entries(opts.attrs ?? {}))
     const classes = new Set(opts.classes ?? [])
     const style: Record<string, string> = { ...(opts.style ?? {}) }
+    const dataset: Record<string, string> = {}
     const loadHandlers: Array<() => void> = []
     const image = {
       style,
+      dataset,
       classList: { contains: (name: string) => classes.has(name) },
       hasAttribute: (name: string) => attrs.has(name),
       complete: opts.complete,
@@ -222,7 +225,7 @@ describe('reserveImageSpace（用最小 DOM 桩，不依赖 jsdom）', () => {
         if (type === 'load') loadHandlers.push(handler)
       },
     }
-    return { image, loadHandlers }
+    return { image, loadHandlers, dataset }
   }
 
   function runOn(images: Array<ReturnType<typeof makeImage>['image']>) {
@@ -305,6 +308,82 @@ describe('reserveImageSpace（用最小 DOM 桩，不依赖 jsdom）', () => {
     runOn([image])
 
     loadHandlers.forEach((handler) => handler())
+    expect(image.style.aspectRatio).toBe('16 / 9')
+  })
+})
+
+describe('settleImageAspectRatio（渲染后图片的比例结算，修复漫画拉伸）', () => {
+  function makeRenderedImage(opts: {
+    naturalWidth?: number
+    naturalHeight?: number
+    style?: Record<string, string>
+    dataset?: Record<string, string>
+    attrs?: Record<string, string>
+  }) {
+    const attrs = new Map<string, string>(Object.entries(opts.attrs ?? {}))
+    return {
+      style: { ...(opts.style ?? {}) },
+      dataset: { ...(opts.dataset ?? {}) },
+      hasAttribute: (name: string) => attrs.has(name),
+      naturalWidth: opts.naturalWidth,
+      naturalHeight: opts.naturalHeight,
+    }
+  }
+
+  function cast(image: ReturnType<typeof makeRenderedImage>) {
+    return image as unknown as HTMLImageElement
+  }
+
+  it('渲染后的图片(带占位标记)结算成固有比例, 竖版漫画不再压成横条', () => {
+    // 复现路径: reserveImageSpace 在游离 DOM 上写 16:9 占位并打标记,
+    // v-html 重新解析出的 <img> 由 load.capture 委托到这里结算。
+    const image = makeRenderedImage({
+      naturalWidth: 800,
+      naturalHeight: 1200,
+      style: { width: '100%', aspectRatio: '16 / 9', height: 'auto' },
+      dataset: { readerAspectFallback: '1' },
+      attrs: { src: 'p1.jpg' },
+    })
+    settleImageAspectRatio(cast(image))
+
+    expect(image.style.aspectRatio).toBe('800 / 1200')
+    expect(image.style.width).toBe('100%')
+    expect(image.style.height).toBe('auto')
+  })
+
+  it('比例已与固有尺寸一致时不改写', () => {
+    const image = makeRenderedImage({
+      naturalWidth: 1600,
+      naturalHeight: 900,
+      style: { aspectRatio: '16 / 9' },
+      dataset: { readerAspectFallback: '1' },
+    })
+    settleImageAspectRatio(cast(image))
+
+    expect(image.style.aspectRatio).toBe('16 / 9')
+  })
+
+  it('书源自己写的 aspect-ratio(无占位标记)不被改写', () => {
+    const image = makeRenderedImage({
+      naturalWidth: 800,
+      naturalHeight: 1200,
+      style: { aspectRatio: '4 / 3' },
+    })
+    settleImageAspectRatio(cast(image))
+
+    expect(image.style.aspectRatio).toBe('4 / 3')
+  })
+
+  it('带 width/height 属性的图片不结算(比例由属性推导)', () => {
+    const image = makeRenderedImage({
+      naturalWidth: 800,
+      naturalHeight: 1200,
+      style: { aspectRatio: '16 / 9' },
+      dataset: { readerAspectFallback: '1' },
+      attrs: { width: '1024', height: '576' },
+    })
+    settleImageAspectRatio(cast(image))
+
     expect(image.style.aspectRatio).toBe('16 / 9')
   })
 })

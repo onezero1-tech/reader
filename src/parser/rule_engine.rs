@@ -35,6 +35,21 @@ fn get_template_re() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"@get:\{([^}]+)\}").unwrap())
 }
 
+/// 单花括号 JSONPath 模板：`https://cin.onl/v/{$.id}`。
+///
+/// 一类书源(漫画/图站接口源)在 `ruleSearch.bookUrl` 里写 `{$.字段}`, 要求把
+/// 当前列表项的字段值填进 URL。此前只认双花括号 `{{...}}`, 该模板被原样
+/// 留在 bookUrl 里, 后果有两个:
+///   1. 目录抓取直接请求字面量 `https://cin.onl/v/{$.id}` —— 页面解析为
+///      0 章, 点阅读提示「目录为空」, 正文规则里 `result.match(...)[0]`
+///      在空页面上抛 "cannot read property of null"(reader::js 日志);
+///   2. 探索/搜索每本书的 bookUrl 全都一样, 前端按 bookUrl 去重
+///      (explore.ts 与 legado `appendReplacing` 对齐)后整页只剩一本。
+fn json_path_template_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?s)\{(\$[^{}]{1,256})\}").unwrap())
+}
+
 fn placeholder_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"\$(\d{1,2})").unwrap())
@@ -2330,7 +2345,7 @@ fn interpolate_json_templates(
     ctx: &HashMap<String, String>,
 ) -> String {
     let re = inline_js_lazy_re();
-    re.replace_all(rule, |caps: &regex::Captures| {
+    let interpolated = re.replace_all(rule, |caps: &regex::Captures| {
         let expr = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
         if expr.is_empty() {
             return String::new();
@@ -2383,8 +2398,50 @@ fn interpolate_json_templates(
             Ok(res) => res,
             Err(_) => String::new(),
         }
-    })
-    .into_owned()
+    });
+    // `{{...}}` 双花括号求值完, 再展开单花括号 `{$.field}` 模板。
+    // 双花括号替换后的产物里若残留 `{$.x}`(字段取不到时占位还在), 同样按
+    // 当前列表项求值一次, 保证 `https://host/v/{$.id}` 这类写法真正生效。
+    let interpolated = interpolate_json_path_templates(&interpolated, v);
+    interpolated
+}
+
+/// 展开字段规则里的单花括号 JSONPath 模板 `{$.id}`(见 `json_path_template_re`)。
+///
+/// 手动扫描而非 `replace_all` 捕获相邻字符: 捕获组会吃掉相邻模板的花括号,
+/// `{$.a}{$.b}` 的第二个模板会被漏掉。求值复用 `pick_json_field`, 因此
+/// `{$.a||$.b}` 这类回退链同样有效; 取不到值时**保留原样**, 不吞掉用户数据。
+fn interpolate_json_path_templates(rule: &str, v: &Value) -> String {
+    let re = json_path_template_re();
+    if !rule.contains('{') {
+        return rule.to_string();
+    }
+    let bytes = rule.as_bytes();
+    let mut out = String::with_capacity(rule.len());
+    let mut last = 0usize;
+    for matched in re.find_iter(rule) {
+        let start = matched.start();
+        let end = matched.end();
+        // 属于 `{{...}}` 双花括号模板的一部分: 前邻 `{` 或后邻 `}` 时原样保留,
+        // 不能把 `{{$.a}}` 拆成 `{` + 展开值 + `}`。
+        let part_of_double = (start > 0 && bytes[start - 1] == b'{')
+            || (end < bytes.len() && bytes[end] == b'}');
+        out.push_str(&rule[last..start]);
+        if part_of_double {
+            out.push_str(matched.as_str());
+        } else {
+            let expr = &matched.as_str()[1..matched.as_str().len() - 1];
+            match pick_json_field(v, Some(expr)) {
+                Some(val) if !val.is_empty() => out.push_str(&val),
+                // 字段缺失时保持模板原样: 与其拼出错误 URL, 不如让上游
+                // 的空值检查(如书名为空的过滤)去兜底。
+                _ => out.push_str(matched.as_str()),
+            }
+        }
+        last = end;
+    }
+    out.push_str(&rule[last..]);
+    out
 }
 
 fn interpolate_common_templates(

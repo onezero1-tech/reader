@@ -477,7 +477,7 @@ import { isLocalBook, isLocalEpubBook } from '../utils/localBook'
 import { PDF_PAGE_ATTR, isPdfBook, releasePdfBook, renderPdfChapterPages } from '../utils/pdfPages'
 import { rewriteCssAssetUrls, toReaderAssetUrl } from '../utils/localEpubAsset'
 import { readerWindowBackground as composeReaderWindowBackground } from '../utils/readerBackground'
-import { processSourceImageOptions, reserveImageSpace } from '../utils/sourceImageOptions'
+import { processSourceImageOptions, reserveImageSpace, settleImageAspectRatio } from '../utils/sourceImageOptions'
 import { repairSourceImageHtml } from '../utils/sourceImageHtml'
 import { handleReaderFontSizeWheel } from '../utils/readerFontSize'
 import { createReaderProgressAutoSaveScheduler, createReaderProgressExitSaver } from '../utils/readerProgressAutoSave'
@@ -1269,6 +1269,12 @@ function queueLoadedImagePagination(image: unknown) {
 }
 
 function handleReaderImageLoad(event: Event) {
+  if (event.target instanceof HTMLImageElement) {
+    // 16:9 占位必须换成固有比例, 否则竖版漫画页被钉死成横条(拉伸变形)。
+    // reserveImageSpace 的监听器绑在游离 wrapper 上, 渲染出来的 <img> 只能靠
+    // 这里结算(load 不冒泡, 容器上是 @load.capture)。
+    settleImageAspectRatio(event.target)
+  }
   queueLoadedImagePagination(event.target)
 }
 
@@ -4241,6 +4247,18 @@ watch(() => store.content, () => {
   // 跨章回退时正文到达触发的这次重建, 才是"新章分页就绪"的主路径(见
   // applyPendingPrevChapterLanding); 上面刚把索引清 0, 这里紧接着兑现落位。
   void rebuildHorizontalPages().then(applyPendingPrevChapterLanding)
+})
+
+// 缓存命中的图片不会再触发 load 事件, 16:9 占位比例要在这里补结算:
+// load.capture 只覆盖异步解码的图, complete 的图从渲染起就已就绪。
+// (横向分页模式里 constrainBlockMedia 已剥掉 aspect-ratio, 结算是空操作。)
+watch(formattedContent, () => {
+  void nextTick().then(() => {
+    if (!mounted) return
+    scrollContainerRef.value?.querySelectorAll('img').forEach((image) => {
+      if (image.complete) settleImageAspectRatio(image)
+    })
+  })
 })
 
 watch(() => store.currentIndex, async () => {
