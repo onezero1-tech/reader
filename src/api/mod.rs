@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod deep_link;
+pub mod media_stream;
 pub mod protocol;
 pub mod remote_text;
 
@@ -35,6 +36,7 @@ pub struct AppState {
 pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         commands::health,
+        commands::media_stream::media_stream_base,
         commands::backup::export_local_books,
         commands::backup::import_local_books,
         commands::backup::export_custom_fonts,

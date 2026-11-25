@@ -7,6 +7,7 @@ pub mod debug;
 pub mod edge_tts;
 pub mod export;
 pub mod http_tts;
+pub mod media_stream;
 pub mod ms_demo_tts;
 pub mod network;
 pub mod reading_stats;

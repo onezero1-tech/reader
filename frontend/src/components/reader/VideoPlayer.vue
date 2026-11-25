@@ -14,6 +14,7 @@
  * 不需要用户手动清理缓存。
  */
 import { onBeforeUnmount, ref, watch } from 'vue'
+import { toLoopbackMediaUrl } from '../../api/mediaStream'
 
 const props = defineProps<{
   /** 已代理(/media)的播放地址。 */
@@ -180,8 +181,14 @@ async function attach() {
   if (props.kind === 'mp4') {
     // mp4 由 <video> 直接拉流(后端分块 Range 回传, 见 book_service
     // MEDIA_CHUNK_LIMIT), 速度靠 Resource Timing 统计 /media 响应。
+    //
+    // 改道回环 HTTP: WebKitGTK 的媒体栈对 reader:// 协议响应的 Range 语义
+    // 处理不可靠(嗅探请求成功后管线静默放弃, 起播永远转圈), 127.0.0.1 的
+    // 真实 HTTP 则被 soup 源原样支持。服务不可用时返回原地址(协议路径兜底)。
+    const src = await toLoopbackMediaUrl(props.src)
+    if (gen !== generation) return
     observeResourceTiming()
-    el.src = props.src
+    el.src = src
     void el.play().catch(() => {})
     return
   }

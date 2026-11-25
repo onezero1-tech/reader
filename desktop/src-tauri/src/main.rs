@@ -219,6 +219,15 @@ fn start(app: &mut App, paths: &portable::Paths) -> anyhow::Result<()> {
     let state = tauri::async_runtime::block_on(bootstrap::build_state(&cfg))?;
     app.manage(state);
 
+    // 回环媒体流服务: mp4 直链的 <video> 改走 127.0.0.1 真实 HTTP, 绕开
+    // WebKitGTK 媒体栈对 reader:// 协议响应 Range 语义的缺陷(嗅探请求成功
+    // 后管线静默放弃、视频永远转圈)。详见 api::media_stream 模块注释。
+    // 失败只记日志: 协议路径仍是兜底, 不能因此拖垮启动。
+    {
+        let media_state = app.state::<reader_rust::api::AppState>().inner().clone();
+        tauri::async_runtime::spawn(reader_rust::api::media_stream::start(media_state));
+    }
+
     // Web 访问: 状态容器 + 按上次保存的配置自动启动。
     // 必须在 `app.manage(state)` 之后 —— autostart 需要 `AppState`。
     app.manage(reader_rust::server::control::WebServerState::new(
