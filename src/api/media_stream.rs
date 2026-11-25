@@ -39,6 +39,9 @@ use std::sync::OnceLock;
 /// 写入; 前端经 `media_stream_base` 命令读取后拼 `/media?path=...` 使用。
 static BASE_URL: OnceLock<String> = OnceLock::new();
 
+/// 访问 token(基址的路径尾段)。与 BASE_URL 同时写入; 不匹配一律 404。
+static TOKEN: OnceLock<String> = OnceLock::new();
+
 /// 回环媒体服务基址; 未启动(或启动失败)时返回 None, 前端回退协议地址。
 pub fn base_url() -> Option<&'static str> {
     BASE_URL.get().map(String::as_str)
