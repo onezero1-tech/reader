@@ -7,21 +7,15 @@
       <div class="toolbar-primary">
         <h1 class="view-title">发现书海</h1>
 
+        <!-- 可搜索的书源选择器：聚合源动辄上百个, 原生 <select> 没法检索,
+             打开面板输入关键字按 名称/分组/网址 即时过滤。 -->
         <div class="source-selector" v-if="store.exploreSources.length > 0">
-          <select
-            class="field source-select"
-            :value="store.activeSourceUrl"
+          <SourceSearchSelect
+            :sources="store.exploreSources"
+            :model-value="store.activeSourceUrl"
             :disabled="store.categoriesLoading"
             @change="onSourceChange"
-          >
-            <option
-              v-for="src in store.exploreSources"
-              :key="src.bookSourceUrl"
-              :value="src.bookSourceUrl"
-            >
-              {{ src.bookSourceName }}
-            </option>
-          </select>
+          />
         </div>
         <span v-else class="no-sources-text">无带有发现规则的书源</span>
 
@@ -219,6 +213,7 @@ import BookGrid from '../components/BookGrid.vue'
 import BookDetailModal from '../components/BookDetailModal.vue'
 import SourceBrowserPanel from '../components/SourceBrowserPanel.vue'
 import SourceLoginDialog from '../components/source-manager/SourceLoginDialog.vue'
+import SourceSearchSelect from '../components/SourceSearchSelect.vue'
 import { showContextMenu } from '../composables/useContextMenu'
 import { useSourceImport } from '../composables/useSourceImport'
 import type { Book, SearchBook } from '../types'
@@ -302,12 +297,12 @@ watch(
   { deep: false },
 )
 
-function onSourceChange(event: Event) {
+function onSourceChange(url: string) {
   // 切源时丢弃未触发的输入防抖: 它们的 action 属于上一个源，落定后会被
   // runAction 打到新源上（旧 kind 对新源无意义）。
   clearTextTimers()
   coverCacheSession.release(shelfStore.books)
-  void store.setSource((event.target as HTMLSelectElement).value)
+  void store.setSource(url)
 }
 
 /** 清空所有待触发的输入防抖计时器。 */
@@ -605,12 +600,6 @@ function handleBookInfo(book: Book | SearchBook) {
   border-color: var(--color-primary);
   color: var(--color-primary);
   background: var(--color-primary-bg);
-}
-
-.source-select {
-  width: 100%;
-  cursor: pointer;
-  font-weight: 500;
 }
 
 .no-sources-text {

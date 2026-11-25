@@ -4438,8 +4438,14 @@ impl BookService {
                 }
             }
         }
-        let res = res.map_err(|e| AppError::Internal(e.into()))?;
+        // 带区间切片时要用 chunk() 增量读体, 这里必须可变绑定。
+        let mut res = res.map_err(|e| AppError::Internal(e.into()))?;
         let status = res.status().as_u16();
+        if !(200..300).contains(&status) {
+            // 2xx 之外(403 签名过期/404 下架)无需读体: 错误直接上抛,
+            // 播放器据此走 forceRefresh 重取正文拿新签名地址。
+            return Err(AppError::NotFound(format!("media fetch failed: {status}")));
+        }
         let upstream_content_type = res
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -4456,17 +4462,68 @@ impl BookService {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let base_url = res.url().to_string();
-        let bytes = res
-            .bytes()
-            .await
-            .map_err(|e| AppError::Internal(e.into()))?
-            .to_vec();
 
-        let is_playlist = media_url_is_playlist(&spec.url, upstream_content_type.as_deref(), &bytes);
-        if !(200..300).contains(&status) {
-            return Err(AppError::NotFound(format!("media fetch failed: {status}")));
-        }
+        // ── 大体积直链媒体的分块回传(修复"视频缓冲很久才起播") ──
+        //
+        // 协议 handler 的响应体是整块 Vec<u8>, 本身无法真流式; 旧实现把上游
+        // 响应体一次性读完整才回给 WebView —— 直链 mp4(几百 MB)要等整个文件
+        // 下载完, 播放器才拿到第一个字节, 表现就是起播前转圈几分钟。
+        //
+        // 浏览器媒体栈(<video>)拉流必带 Range 头, 且能消化 206 + Content-Range
+        // 的分块响应: 这里把"无界"响应截成单块(MEDIA_CHUNK_LIMIT)回传, 播放器
+        // 按需继续拉后续区间, 起播耗时从"整个文件"降到"一块"。
+        //
+        // 只有带 Range 头的请求才截断: hls.js 的播放列表/分片/密钥请求都不带
+        // Range, 截断会让它把残缺体当成完整分片, 直接破坏解码 —— 这类请求
+        // 保持整读(分片本身不大, 播放列表更小)。
+        let client_range_start = parse_range_start(range_header);
+        let mut sliced_headers: Option<String> = None;
+        let bytes = if let Some(client_start) = client_range_start {
+            let upstream_range = content_range.as_deref().and_then(parse_content_range);
+            let (window_start, known_total) = match upstream_range {
+                // 上游真的按区间返回: 响应体起点即区间起点。
+                Some((cs, _ce, ct)) => (cs, ct),
+                None if status == 206 => (client_start, None),
+                // 上游忽略 Range 返回整包(200): 响应体从 0 开始,
+                // 需要自己丢掉前 client_start 字节才是客户端要的区间。
+                None => (client_start, res.content_length()),
+            };
+            // 上游 206 时字节已从区间起点开始, 无需跳过; 上游 200 时跳过前缀。
+            let skip = if status == 206 { 0 } else { window_start };
+            let (body, truncated) =
+                read_media_bytes(&mut res, skip, MEDIA_CHUNK_LIMIT).await?;
+            if truncated || (skip > 0 && !body.is_empty()) {
+                let total_text = known_total
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "*".to_string());
+                sliced_headers = Some(format!(
+                    "bytes {}-{}/{}",
+                    window_start,
+                    window_start + body.len() as u64 - 1,
+                    total_text
+                ));
+            }
+            body
+        } else {
+            res.bytes()
+                .await
+                .map_err(|e| AppError::Internal(e.into()))?
+                .to_vec()
+        };
+
+        // 被截断/切片过的响应绝不是播放列表(列表只有几 KB, 且这类请求不带
+        // Range), 直接按媒体字节回传。
+        let is_playlist = sliced_headers.is_none()
+            && media_url_is_playlist(&spec.url, upstream_content_type.as_deref(), &bytes);
         if !is_playlist {
+            let (status, content_range, accept_ranges) = match sliced_headers {
+                Some(content_range) => (
+                    206u16,
+                    Some(content_range),
+                    Some("bytes".to_string()),
+                ),
+                None => (status, content_range, accept_ranges),
+            };
             return Ok(MediaPayload {
                 bytes,
                 content_type: upstream_content_type
@@ -5781,6 +5838,88 @@ pub struct MediaPayload {
     pub is_playlist: bool,
 }
 
+/// 单次回传给播放器的媒体字节上限。
+///
+/// 只对带 Range 头的渐进式拉流请求生效(见 `get_media_for_source`): 起播只需
+/// 一块(4 MiB), 播放器会按需继续拉后续区间; hls.js 的分片请求不带 Range,
+/// 不受影响。
+const MEDIA_CHUNK_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// 解析客户端 Range 头的起点: `bytes=100-` / `bytes=100-200` → `Some(100)`。
+///
+/// `bytes=-500`(后缀区间)没有确定起点、多区间 Range(`0-1,5-9`)不合法,
+/// 都返回 None —— 调用方会走整读路径, 不做截断。
+fn parse_range_start(range_header: Option<&str>) -> Option<u64> {
+    let value = range_header?.trim();
+    let spec = value.strip_prefix("bytes=")?.trim();
+    let first = spec.split(',').next()?.trim();
+    let (start, _) = first.split_once('-')?;
+    start.trim().parse::<u64>().ok()
+}
+
+/// 解析上游 Content-Range: `bytes 0-999/2000` → `(0, 999, Some(2000))`;
+/// 总长未知(`bytes 0-999/*`) → `(0, 999, None)`。
+fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let v = value.trim().strip_prefix("bytes").unwrap_or(value.trim());
+    let v = v.trim_start_matches([' ', '=', '\t']).trim();
+    let (range_part, total_part) = v.split_once('/')?;
+    let (start, end) = range_part.trim().split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = end.trim().parse::<u64>().ok()?;
+    // "*" → 解析失败 → None, 正是"总长未知"的语义。
+    let total = total_part.trim().parse::<u64>().ok();
+    Some((start, end, total))
+}
+
+/// 从上游响应读取媒体字节, 必要时截断成单块。
+///
+/// 返回 `(字节, 是否截断)`。`skip` 是要丢弃的前置字节数(上游忽略 Range 返回
+/// 整包时, 用它跳到客户端请求的起点); `limit` 是单块上限 —— 到达上限后再探测
+/// 一次流是否还有数据, 恰好整读完(流已结束)不算截断。探测用的那一小块属于
+/// 下一个区间, 丢弃没有影响: 截断时客户端本就会按 Content-Range 继续请求。
+async fn read_media_bytes(
+    res: &mut reqwest::Response,
+    skip: u64,
+    limit: u64,
+) -> Result<(Vec<u8>, bool), AppError> {
+    let cap = limit as usize;
+    let mut body: Vec<u8> = Vec::new();
+    let mut to_skip = skip;
+    let mut truncated = false;
+    while !truncated {
+        let chunk = match res.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(err) => return Err(AppError::Internal(err.into())),
+        };
+        if to_skip > 0 {
+            let n = chunk.len() as u64;
+            if n <= to_skip {
+                to_skip -= n;
+                continue;
+            }
+            let keep_from = to_skip as usize;
+            to_skip = 0;
+            body.extend_from_slice(&chunk[keep_from..]);
+        } else {
+            body.extend_from_slice(&chunk);
+        }
+        if body.len() > cap {
+            body.truncate(cap);
+            truncated = true;
+        }
+    }
+    // 恰好到达上限且流里还有数据 → 截断; 流恰好结束 → 完整。
+    if body.len() == cap && !truncated {
+        match res.chunk().await {
+            Ok(Some(_)) => truncated = true,
+            Ok(None) => {}
+            Err(err) => return Err(AppError::Internal(err.into())),
+        }
+    }
+    Ok((body, truncated))
+}
+
 /// 判断媒体响应是否为 m3u8 播放列表。
 ///
 /// 三个判据按可靠性排序: URL 后缀 → Content-Type → `#EXTM3U` 魔数。
@@ -6200,6 +6339,34 @@ mod tests {
             Some("video/mp2t"),
             b"\x47\x40\x01\x00"
         ));
+    }
+
+    /// 客户端 Range 起点解析: 开放/闭合区间取起点; 后缀区间(`bytes=-500`)
+    /// 与无 Range 头返回 None(调用方走整读路径, 不截断)。
+    #[test]
+    fn parse_range_start_covers_open_closed_and_invalid_forms() {
+        assert_eq!(parse_range_start(Some("bytes=0-")), Some(0));
+        assert_eq!(parse_range_start(Some("bytes=1048576-")), Some(1048576));
+        assert_eq!(parse_range_start(Some("bytes=100-199")), Some(100));
+        assert_eq!(parse_range_start(Some(" bytes=100-199 ")), Some(100));
+        assert_eq!(parse_range_start(Some("bytes=-500")), None);
+        assert_eq!(parse_range_start(Some("other=0-")), None);
+        assert_eq!(parse_range_start(None), None);
+    }
+
+    /// 上游 Content-Range 解析: 标准空格分隔、`bytes=` 写法、未知总长(`*`)。
+    #[test]
+    fn parse_content_range_covers_known_and_unknown_totals() {
+        assert_eq!(
+            parse_content_range("bytes 0-999/2000"),
+            Some((0, 999, Some(2000)))
+        );
+        assert_eq!(
+            parse_content_range("bytes=100-199/300"),
+            Some((100, 199, Some(300)))
+        );
+        assert_eq!(parse_content_range("bytes 0-4194303/*"), Some((0, 4194303, None)));
+        assert_eq!(parse_content_range("garbage"), None);
     }
 
     /// 空行保留、引号形式 URI='...' 也能改写。

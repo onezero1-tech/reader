@@ -32,11 +32,125 @@ const videoRef = ref<HTMLVideoElement>()
 const failed = ref(false)
 const loading = ref(true)
 const hint = ref('')
+/** 左下角状态条: 下载速度 + 可缓冲秒数, 用来区分「网速慢」还是「实现有问题」。 */
+const statusText = ref('')
 
 /** hls.js 实例; 非空时必须在卸载/换源时 destroy, 否则媒体流与缓冲不释放。 */
 let hlsInstance: { destroy(): void } | null = null
 /** 防御动态 import 返回后 src 已变化/组件已卸载的竞态。 */
 let generation = 0
+
+// ── 下载速度 / 缓冲监测 ──
+//
+// 「缓冲久」有两种成因: 网速慢(速度低、缓冲爬不动)或链路有问题(速度高却
+// 不起播)。把两个指标都摆出来, 用户一眼能分清。
+//
+// - HLS: hls.js 的 FRAG_BUFFERED 事件带每个分片的字节数, 最可靠;
+// - mp4: 浏览器直接用 <video> 拉流, 借 Resource Timing 统计 /media 响应
+//   的字节数(WebView 若不产出该条目, 就只显示缓冲秒数)。
+const SPEED_WINDOW_MS = 8000
+interface SpeedSample {
+  at: number
+  bytes: number
+}
+let speedSamples: SpeedSample[] = []
+let speedTimer: ReturnType<typeof setInterval> | null = null
+let perfObserver: PerformanceObserver | null = null
+
+function recordBytes(bytes: number) {
+  if (bytes <= 0) return
+  const now = performance.now()
+  speedSamples.push({ at: now, bytes })
+  const cutoff = now - SPEED_WINDOW_MS
+  while (speedSamples.length > 0 && speedSamples[0].at < cutoff) speedSamples.shift()
+}
+
+/** 滑动窗口内的平均下载速度(B/s); 窗口内没有采样时返回 null。 */
+function computeSpeed(): number | null {
+  const now = performance.now()
+  const cutoff = now - SPEED_WINDOW_MS
+  while (speedSamples.length > 0 && speedSamples[0].at < cutoff) speedSamples.shift()
+  if (speedSamples.length === 0) return null
+  const spanMs = now - speedSamples[0].at
+  const bytes = speedSamples.reduce((sum, s) => sum + s.bytes, 0)
+  if (spanMs < 300 || bytes <= 0) return null
+  return bytes / (spanMs / 1000)
+}
+
+function formatSpeed(bytesPerSecond: number): string {
+  if (bytesPerSecond >= 1024 * 1024) {
+    return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`
+  }
+  if (bytesPerSecond >= 1024) {
+    return `${Math.round(bytesPerSecond / 1024)} KB/s`
+  }
+  return `${Math.round(bytesPerSecond)} B/s`
+}
+
+/** 当前播放点之后的可缓冲秒数; 元数据未就绪时返回 null。 */
+function bufferedAhead(el: HTMLVideoElement): number | null {
+  if (el.readyState === 0 || el.buffered.length === 0) return null
+  const t = el.currentTime
+  for (let i = 0; i < el.buffered.length; i++) {
+    if (t >= el.buffered.start(i) - 0.01 && t <= el.buffered.end(i)) {
+      return Math.max(0, el.buffered.end(i) - t)
+    }
+  }
+  return null
+}
+
+function updateStatusText() {
+  const el = videoRef.value
+  if (!el || failed.value) {
+    statusText.value = ''
+    return
+  }
+  const parts: string[] = []
+  const speed = computeSpeed()
+  if (speed !== null) parts.push(`↓ ${formatSpeed(speed)}`)
+  const ahead = bufferedAhead(el)
+  if (ahead !== null) parts.push(`缓冲 ${Math.round(ahead)}s`)
+  statusText.value = parts.join(' · ')
+}
+
+function startStatusTimer() {
+  stopStatusTimer()
+  speedSamples = []
+  updateStatusText()
+  speedTimer = setInterval(updateStatusText, 1000)
+}
+
+function stopStatusTimer() {
+  if (speedTimer !== null) {
+    clearInterval(speedTimer)
+    speedTimer = null
+  }
+}
+
+/** mp4 直链的字节统计: 观察 /media 响应的 Resource Timing 条目。 */
+function observeResourceTiming() {
+  if (perfObserver !== null) return
+  try {
+    perfObserver = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        const resource = entry as PerformanceResourceTiming
+        if (!resource.name.includes('/media?')) continue
+        const size = resource.transferSize || resource.encodedBodySize || resource.decodedBodySize || 0
+        if (size > 0) recordBytes(size)
+      }
+    })
+    perfObserver.observe({ type: 'resource', buffered: true } as PerformanceObserverInit)
+  } catch {
+    perfObserver = null
+  }
+}
+
+function stopResourceTiming() {
+  if (perfObserver !== null) {
+    perfObserver.disconnect()
+    perfObserver = null
+  }
+}
 
 async function attach() {
   destroy()
@@ -46,8 +160,12 @@ async function attach() {
   hint.value = ''
   loading.value = true
   const gen = ++generation
+  startStatusTimer()
 
   if (props.kind === 'mp4') {
+    // mp4 由 <video> 直接拉流(后端分块 Range 回传, 见 book_service
+    // MEDIA_CHUNK_LIMIT), 速度靠 Resource Timing 统计 /media 响应。
+    observeResourceTiming()
     el.src = props.src
     void el.play().catch(() => {})
     return
@@ -68,12 +186,25 @@ async function attach() {
       }
       return
     }
-    const hls = new Hls({ maxBufferLength: 30, maxMaxBufferLength: 60 })
+    const hls = new Hls({
+      // 起播后尽量多缓冲: 网络抖动/慢 CDN 时不易卡顿。上限同时受
+      // maxMaxBufferLength 与 maxBufferSize 约束, 内存不会无限增长。
+      enableWorker: true,
+      maxBufferLength: 60,
+      maxMaxBufferLength: 180,
+      maxBufferSize: 120 * 1000 * 1000,
+      // 已播过的分片只留 30s, 避免长视频的内存膨胀。
+      backBufferLength: 30,
+    })
     hlsInstance = hls
     hls.loadSource(props.src)
     hls.attachMedia(el)
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       void el.play().catch(() => {})
+    })
+    // 分片缓冲完成事件带本分片字节数, 是下载速度最直接的来源。
+    hls.on(Hls.Events.FRAG_BUFFERED, (_event, data) => {
+      recordBytes(data.stats?.loaded ?? 0)
     })
     hls.on(Hls.Events.ERROR, (_event, data) => {
       if (!data.fatal || gen !== generation) return
@@ -108,6 +239,10 @@ function destroy() {
     el.removeAttribute('src')
     el.load()
   }
+  stopStatusTimer()
+  stopResourceTiming()
+  speedSamples = []
+  statusText.value = ''
 }
 
 function retry() {
@@ -135,6 +270,7 @@ onBeforeUnmount(destroy)
         <span class="player-spinner" aria-hidden="true"></span>
         <span>正在加载视频…</span>
       </div>
+      <div v-if="statusText && !failed && !loading" class="player-status">{{ statusText }}</div>
       <div v-if="failed" class="player-error">
         <p>{{ hint || '视频加载失败' }}</p>
         <button type="button" class="player-retry" @click="retry">重试</button>
@@ -162,6 +298,21 @@ onBeforeUnmount(destroy)
   height: 100%;
   display: block;
   object-fit: contain;
+}
+
+/* 下载速度/缓冲指示: 半透明贴在左下角, 不挡控制条(控制条在底部整行)。 */
+.player-status {
+  position: absolute;
+  left: 10px;
+  bottom: 44px;
+  padding: 3px 10px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #ddd;
+  font-size: 12px;
+  line-height: 1.6;
+  pointer-events: none;
+  z-index: 1;
 }
 
 .player-loading,
