@@ -803,9 +803,15 @@ pub async fn media_route(
 
     // 媒体请求全程留痕: 播放卡死时用户日志里必须能看到卡在哪一环
     // (请求没来 = 前端/正文没到; 来了但 status 非 2xx = 源头 403/404;
-    //  来了但耗时巨大 = 网速慢)。URL 只留 host+path, 签名参数不落日志。
+    //  来了但耗时巨大 = 网速慢; 有 request 却迟迟没有 response = 请求挂起)。
+    // URL 只留 host+path, 签名参数不落日志。
     let started = std::time::Instant::now();
     let log_target = media_log_target(url);
+    tracing::info!(
+        target = %log_target,
+        range = range.as_deref().unwrap_or("-"),
+        "media proxy request"
+    );
 
     match state
         .book_service

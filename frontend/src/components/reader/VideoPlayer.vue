@@ -115,7 +115,14 @@ function updateStatusText() {
   // 起播前(视频栈还没拿到可播放的首帧)速度/缓冲都可能没有采样,
   // 但用户最需要知道的是"它还在动还是卡死了" —— 显示起播等待秒数。
   if (loading.value) {
-    parts.push(`起播等待 ${Math.max(0, Math.round((performance.now() - attachStartedAt) / 1000))}s`)
+    const waited = Math.max(0, Math.round((performance.now() - attachStartedAt) / 1000))
+    parts.push(`起播等待 ${waited}s`)
+    // 起播久等 + 窗口内零采样: 大概率不是"网速慢"而是链路/环境问题。
+    // 最常见的是运行时缺解码器(GStreamer libav 加载失败)或直链不可达,
+    // 提示用户往这两个方向查, 而不是无限转圈。
+    if (waited >= 20 && speed === null && bufferedAhead(el) === null) {
+      parts.push('无下载进度: 检查网络或运行时是否缺少视频解码器')
+    }
   }
   statusText.value = parts.join(' · ')
 }
@@ -265,6 +272,10 @@ function retry() {
  *
  * 注意: destroy() 里 removeAttribute('src') + load() 也会触发 error 事件,
  * 没有 src 属性时忽略 —— 那是卸载/换源的副作用, 不是真错误。
+ *
+ * el.error.message 会携带 WebView 底层的原始描述, 例如 WebKitGTK 在运行时
+ * 缺 GStreamer 解码器时报 "Your GStreamer installation is missing a plug-in",
+ * 把它透出比笼统的"网络异常"有用得多 —— 用户直接知道该装解码器。
  */
 function onVideoError() {
   const el = videoRef.value
@@ -272,7 +283,11 @@ function onVideoError() {
   loading.value = false
   failed.value = true
   statusText.value = ''
-  hint.value = '视频加载失败（地址失效或网络异常），请点击重试'
+  const detail = el.error?.message?.trim()
+  if (detail) console.warn('[VideoPlayer] media error:', el.error?.code, detail)
+  hint.value = detail
+    ? `视频加载失败: ${detail}（点击重试）`
+    : '视频加载失败（地址失效或网络异常），请点击重试'
 }
 
 watch(() => props.src, attach, { immediate: true })
