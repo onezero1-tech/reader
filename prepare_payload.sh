@@ -59,6 +59,28 @@ if [ "$total" -ne "$expected" ]; then
   exit 1
 fi
 
+# ---- Debian update-alternatives 布局兼容（libblas3 / liblapack3）----
+# 这两个包把库放在多架构目录的子目录（blas/、lapack/）里；常规路径
+# usr/lib/x86_64-linux-gnu/libblas.so.3 是包安装时由 update-alternatives
+# 维护脚本创建的软链，纯解包 deb 不执行维护脚本，软链缺失。不补链的话
+# 启动脚本注入的 LD_LIBRARY_PATH=$APPDIR/usr/lib/x86_64-linux-gnu 解析不到
+# 库——runtime 层的 gstreamer libav 插件（libgstlibav.so，<video> 的主力
+# H.264/AAC 软解）正是因此加载失败（libblas.so.3: cannot open shared
+# object file），视频永远转圈。这里按子目录内容在常规路径补出同名软链。
+for alt_dir in blas lapack; do
+  subdir="$out/usr/lib/x86_64-linux-gnu/$alt_dir"
+  [ -d "$subdir" ] || continue
+  for lib in "$subdir"/lib*.so.*; do
+    [ -e "$lib" ] || continue
+    name="$(basename "$lib")"
+    link="$out/usr/lib/x86_64-linux-gnu/$name"
+    if [ ! -e "$link" ]; then
+      ln -s "$alt_dir/$name" "$link"
+      echo "    FIX ALT-LINK $link => $alt_dir/$name"
+    fi
+  done
+done
+
 # ---- 以下清理/修补逻辑与官方 install_dep 保持一致 ----
 
 # 清理不需要进 layer 的目录（桌面入口由 linglong.yaml 自己生成）
@@ -82,7 +104,7 @@ if [ "${TRIM_UAB:-1}" = "1" ]; then
          "$out/usr/lib/aspell" "$out/usr/lib/ispell"
   # 3) 翻译文件只留 zh_CN/zh_TW/en_US（约省 4.3MB，中文阅读应用够用）
   #    注意 grep -v 无匹配时返回 1，set -o pipefail 下必须 || true 兜底
-  find "$out/usr/share/locale" -maxdepth 1 -mindepth 1 -type d \
+  find "$out/usr/share/locale" -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
     | grep -vE '/(zh_CN|zh_TW|zh_SG|en_US)$' | xargs -r rm -rf || true
   # 4) 基础拉丁字体：freefont/croscore/liberation（约 27MB）。deepin base
   #    自带 Noto/思源系基础字体，这些是 deb 依赖解析时被拖进来的冗余字体

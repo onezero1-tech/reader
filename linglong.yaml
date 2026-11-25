@@ -33,10 +33,16 @@ base: org.deepin.base/25.2.2
 #      ll-cli repo add community https://cdn-linglong.odata.cc
 runtime: org.deepin.runtime.gtk4/25.2.2
 
-# runtime 没有托盘库（tauri tray-icon 需要 libayatana-appindicator3 及其依赖，
-# 依赖闭环：appindicator3 -> indicator3 -> ido3 / dbusmenu-gtk3 -> dbusmenu-glib，
-# 其余依赖 gtk3/glib/pango 均由 runtime 提供）。仅这 5 个 deb 在宿主机
-# prepare_payload.sh 解包到 payload/（含 sha256 校验）随工程挂载进构建环境。
+# runtime 缺两类库（debs.txt 共 8 个 deb，宿主机 prepare_payload.sh 解包到
+# payload/，含 sha256 校验，随工程挂载进构建环境后由下方 build 拷进 $PREFIX）：
+# 1) 托盘库（tauri tray-icon -> libayatana-appindicator3，依赖闭环：
+#    appindicator3 -> indicator3 -> ido3 / dbusmenu-gtk3 -> dbusmenu-glib，
+#    其余依赖 gtk3/glib/pango 均由 runtime 提供）；
+# 2) gst libav 插件的 blas 系依赖（libblas3/liblapack3/libgfortran5）：runtime
+#    自带的 libgstlibav.so 是 <video> 播放 mp4/H.264 的主力软解，实测因缺
+#    libblas.so.3 加载失败，视频永远转圈。libblas3/liblapack3 的库在多架构
+#    目录的 blas/ lapack/ 子目录里（update-alternatives 布局），常规路径软链
+#    由 prepare_payload.sh 兼容段补出，启动脚本的 LD_LIBRARY_PATH 即可解析。
 
 # 本 build 脚本由 ll-killer layer build 在 runner 的命名空间内执行：
 # 根文件系统 = runner 宿主根（ubuntu-24.04），/project = 本工程目录，

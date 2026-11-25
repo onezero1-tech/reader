@@ -31,8 +31,9 @@
 #   情况 C（版本变更）：只改下方 APP_VERSION 一处，会自动注入 linglong.yaml
 #       的 package.version（注意保持 1.6.6.0 这种 4 段纯数字格式，ll-killer
 #       要求 package.version 必须是 MAJOR.MINOR.PATCH.TWEAK 四段）。
-#   依赖层 debs.txt 只含 5 个托盘 deb（其余依赖由 org.deepin.runtime.gtk4
-#   提供），payload 缓存不变时永远命中——代码更新只重跑编译 job。
+#   依赖层 debs.txt 含 8 个 deb（5 个托盘 + gst libav 插件的 blas 系 3 个，
+#   其余依赖由 org.deepin.runtime.gtk4 提供），payload 缓存不变时永远命中
+#   ——代码更新只重跑编译 job。
 
 name: Build Linglong Package
 
@@ -301,9 +302,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: payload/
-          # 迁移到 org.deepin.runtime.gtk4 后 payload 只剩 5 个托盘 deb，
-          # key 中的 v2 前缀避免命中旧的 71-deb 大缓存
-          key: tray-payload-v2-${{ hashFiles('debs.txt') }}
+          # 迁移到 org.deepin.runtime.gtk4 后 payload 去掉了旧 71-deb 大缓存（v2）；
+          # v3：追加 gst libav 插件的 blas 系 3 个 deb（key 同时含 debs.txt hash，
+          # 内容变更自动换新缓存）
+          key: tray-payload-v3-${{ hashFiles('debs.txt') }}
 
       - name: Install payload tools
         run: sudo apt-get install -y patchelf file curl
@@ -315,6 +317,7 @@ jobs:
           # 注意：deepin 的 deb 是 usr-merged 布局，库在 payload/usr/lib/，
           # 不是 payload/lib/（后者只是部分 deb 带来的空目录）
           if [ -f payload/usr/lib/x86_64-linux-gnu/libayatana-appindicator3.so.1 ] \
+             && [ -f payload/usr/lib/x86_64-linux-gnu/libblas.so.3 ] \
              && [ -f payload/packages.list ]; then
             echo "payload already complete (from cache), skip download"
             exit 0
@@ -329,12 +332,23 @@ jobs:
             || { echo "FAIL: libayatana-appindicator3.so.1 missing (tauri tray-icon 依赖)"; exit 1; }
           test -f payload/usr/lib/x86_64-linux-gnu/libdbusmenu-gtk3.so.4 \
             || { echo "FAIL: libdbusmenu-gtk3.so.4 missing"; exit 1; }
+          # gst libav 插件的 blas 系依赖（用户实测 runtime 的 libgstlibav.so
+          # 加载失败: libblas.so.3 cannot open shared object file, 视频永远转圈）。
+          # libblas3/liblapack3 的库在 blas/ lapack/ 子目录里, 常规路径软链由
+          # prepare_payload.sh 兼容段补出（模拟 update-alternatives）, test -f
+          # 沿软链检查最终文件是否存在。
+          test -f payload/usr/lib/x86_64-linux-gnu/libblas.so.3 \
+            || { echo "FAIL: libblas.so.3 missing (gst libav 插件依赖)"; exit 1; }
+          test -f payload/usr/lib/x86_64-linux-gnu/liblapack.so.3 \
+            || { echo "FAIL: liblapack.so.3 missing (gst libav 插件依赖保险)"; exit 1; }
+          test -f payload/usr/lib/x86_64-linux-gnu/libgfortran.so.5 \
+            || { echo "FAIL: libgfortran.so.5 missing (liblapack3 依赖)"; exit 1; }
           test -f payload/packages.list \
             || { echo "FAIL: packages.list missing"; exit 1; }
           du -sh payload
           count=$(wc -l < payload/packages.list)
           echo "packages.list lines: $count"
-          [ "$count" -eq 5 ] || { echo "FAIL: packages.list 应为 5 个托盘包，实际 $count"; exit 1; }
+          [ "$count" -eq 8 ] || { echo "FAIL: packages.list 应为 8 个包(5 托盘 + libblas3/liblapack3/libgfortran5), 实际 $count"; exit 1; }
 
       # 不做任何依赖拉取：layer build 在命名空间里用宿主 rootfs 执行
       # linglong.yaml 的 build 脚本（纯拷贝二进制/托盘库/图标），产物直接

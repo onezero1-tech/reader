@@ -12,3 +12,15 @@ https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/liba/libayat
 https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/a/ayatana-ido/libayatana-ido3-0.4-0_0.10.1-1_amd64.deb  09d81b029733bd27afc81b3c61fccd64615c30a1bcc7bff4c993f1d7d3b9a5b7
 https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libd/libdbusmenu/libdbusmenu-gtk3-4_18.10.20180917~bzr492+repack1-deepin1_amd64.deb  3eed21075d074284272fa913011f47d48e2b136e3e9a9b7aaf38450312d93bc1
 https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/libd/libdbusmenu/libdbusmenu-glib4_18.10.20180917~bzr492+repack1-deepin1_amd64.deb  5cc2ae8f9032e247d6648ead0a8328233d34ed51ce5e472255611fc0e9e801de
+
+# ---- GStreamer libav 解码插件的 blas 系依赖（2026-11-25 追加）----
+# 用户实测：runtime 层的 libgstlibav.so 加载失败
+#   Failed to load plugin '/runtime/lib/.../libgstlibav.so': libblas.so.3:
+#   cannot open shared object file
+# 该插件是 <video> 播放 mp4/H.264 的主力软解，缺它视频永远转圈。三个包的
+# 依赖链已用 readelf 实测闭环：liblapack3 -> libblas3 + libgfortran5 -> libc 系。
+# 注意 libblas3/liblapack3 的库在多架构目录的 blas/ lapack/ 子目录里
+# （update-alternatives 布局），常规路径软链由 prepare_payload.sh 兼容段补出。
+https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/l/lapack/libblas3_3.11.0-2_amd64.deb  4593968beae667f8d58b700e63c047f3f0ecab70482cd4696246ded9ae7294ac
+https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/l/lapack/liblapack3_3.11.0-2_amd64.deb  8c370498cc58fad13de40aa3e50103f38763779d55a2acd9aacd3cdaf7f552c8
+https://ci.deepin.com/repo/deepin/deepin-community/stable/pool/main/g/gcc-13/libgfortran5_13.2.0-3deepin4_amd64.deb  8e62468483e18f9922bd64d2874c2fe03b3a9fda23dfa0a04d7e8db0bbf8dd0e
