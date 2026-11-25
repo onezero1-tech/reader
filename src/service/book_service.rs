@@ -4366,12 +4366,19 @@ impl BookService {
     ///
     /// 播放地址带签名与时效（`?t=..&sign=..`），**绝不缓存**：既不写盘也不进
     /// 内存缓存，列表每次重新拉取。
+    ///
+    /// `slice_unranged`: 调用方是否为回环 HTTP 媒体服务(`api::media_stream`)。
+    /// 该路径的消费者只有 `<video>` 原生媒体栈, 且 WebKit 的首个媒体请求
+    /// **不带 Range** —— 这里会给上游强制补 `Range: bytes=0-` 并按块回传
+    /// 206; 协议路径(reader://)的消费者是 hls.js, 其无 Range 请求(分片/
+    /// 列表)绝不能截断, 必须保持整读。
     pub async fn get_media_for_source(
         &self,
         user_ns: &str,
         raw_url: &str,
         source: Option<&BookSource>,
         range_header: Option<&str>,
+        slice_unranged: bool,
     ) -> Result<MediaPayload, AppError> {
         let raw_url = raw_url.trim();
 
@@ -4398,6 +4405,16 @@ impl BookService {
             .http
             .source_context(user_ns, &source_url, None)
             .map_err(AppError::Internal)?;
+        // 回环路径的无 Range 请求要强制上游按区间回包: 若放任整包传输, 几百
+        // MB 的直链要读完整个文件才回第一个字节, 途中连接被掐断(实测一类 CDN
+        // 会直接 FIN)或撞上总超时就整单失败。带上 `bytes=0-` 后上游要么 206
+        // (可分块续拉), 要么 200 整包(与旧行为一致), 两种都能被下面的有界读
+        // 体处理。播放列表(.m3u8 后缀)不需要区间, 不强加。
+        let client_range_start = parse_range_start(range_header);
+        let force_upstream_range = slice_unranged
+            && client_range_start.is_none()
+            && range_header.is_none()
+            && !media_url_is_playlist_by_url(&spec.url);
         let build_request = |client: &reqwest::Client| {
             let mut req = client.get(&spec.url);
             for (name, value) in &spec.headers {
@@ -4408,8 +4425,12 @@ impl BookService {
                     req = req.header(name, value);
                 }
             }
-            if let Some(range) = range_header.filter(|v| !v.trim().is_empty()) {
-                if let Ok(value) = reqwest::header::HeaderValue::from_str(range.trim()) {
+            let upstream_range = range_header
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .or_else(|| force_upstream_range.then(|| "bytes=0-".to_string()));
+            if let Some(range) = upstream_range {
+                if let Ok(value) = reqwest::header::HeaderValue::from_str(&range) {
                     req = req.header(reqwest::header::RANGE, value);
                 }
             }
@@ -4423,23 +4444,27 @@ impl BookService {
             );
             req
         };
-        let mut res = build_request(&context.client).send().await;
-        let retry_status = match &res {
+        let mut first = build_request(&context.client).send().await;
+        let retry_status = match &first {
             Ok(response) => Some(response.status().as_u16()),
             Err(_) => None,
         };
+        // 断流续传要沿"当前生效的链路"重开连接: 若首连因代理被拦改走了直连,
+        // 续传也必须走直连, 不然每次重连都回到坏链路上。
+        let mut active_client = context.client.clone();
         if cover_needs_direct_retry(context.proxy.is_some(), retry_status) {
             if let Ok(direct) = self.http.source_context_direct(user_ns, &source_url) {
                 if let Ok(direct_res) = build_request(&direct.client).send().await {
                     if direct_res.status().is_success() {
                         tracing::info!(url = %spec.url, "proxy media request blocked; used direct retry");
-                        res = Ok(direct_res);
+                        active_client = direct.client.clone();
+                        first = Ok(direct_res);
                     }
                 }
             }
         }
         // 带区间切片时要用 chunk() 增量读体, 这里必须可变绑定。
-        let mut res = res.map_err(|e| AppError::Internal(e.into()))?;
+        let mut res = first.map_err(|e| AppError::Internal(e.into()))?;
         let status = res.status().as_u16();
         if !(200..300).contains(&status) {
             // 2xx 之外(403 签名过期/404 下架)无需读体: 错误直接上抛,
@@ -4467,49 +4492,112 @@ impl BookService {
         //
         // 协议 handler 的响应体是整块 Vec<u8>, 本身无法真流式; 旧实现把上游
         // 响应体一次性读完整才回给 WebView —— 直链 mp4(几百 MB)要等整个文件
-        // 下载完, 播放器才拿到第一个字节, 表现就是起播前转圈几分钟。
+        // 下载完, 播放器才拿到第一个字节, 表现就是起播前转圈几分钟, 而且长
+        // 传输极易被 CDN/中转掐断或撞上总超时, 一断整单作废。
         //
-        // 浏览器媒体栈(<video>)拉流必带 Range 头, 且能消化 206 + Content-Range
-        // 的分块响应: 这里把"无界"响应截成单块(MEDIA_CHUNK_LIMIT)回传, 播放器
-        // 按需继续拉后续区间, 起播耗时从"整个文件"降到"一块"。
+        // 浏览器媒体栈(<video>)拉流能消化 206 + Content-Range 的分块响应:
+        // 这里把"无界"响应截成单块(MEDIA_CHUNK_LIMIT)回传, 播放器按需继续拉
+        // 后续区间, 起播耗时从"整个文件"降到"一块"。
         //
-        // 只有带 Range 头的请求才截断: hls.js 的播放列表/分片/密钥请求都不带
-        // Range, 截断会让它把残缺体当成完整分片, 直接破坏解码 —— 这类请求
-        // 保持整读(分片本身不大, 播放列表更小)。
-        let client_range_start = parse_range_start(range_header);
-        let mut sliced_headers: Option<String> = None;
-        let bytes = if let Some(client_start) = client_range_start {
+        // 消费者分两类:
+        // - 带 Range 的请求一定来自原生媒体栈(嗅探/续传拉流), 截断安全;
+        // - 不带 Range 的请求要区分: 回环 HTTP 路径(force_upstream_range,
+        //   上游已被强制 bytes=0-)只有原生媒体栈, 其首个请求不带 Range,
+        //   截断安全且必要; 协议路径上是 hls.js 的 fetch, 分片被截断会把
+        //   残缺体当完整分片直接破坏解码 —— 这类请求保持整读。播放列表
+        //   (.m3u8, 几 KB)永不截断。
+        let slice_this_request = client_range_start.is_some() || force_upstream_range;
+        let (window_start, known_total) = if slice_this_request {
             let upstream_range = content_range.as_deref().and_then(parse_content_range);
-            let (window_start, known_total) = match upstream_range {
+            match upstream_range {
                 // 上游真的按区间返回: 响应体起点即区间起点。
                 Some((cs, _ce, ct)) => (cs, ct),
-                None if status == 206 => (client_start, None),
+                None if status == 206 => (client_range_start.unwrap_or(0), None),
                 // 上游忽略 Range 返回整包(200): 响应体从 0 开始,
-                // 需要自己丢掉前 client_start 字节才是客户端要的区间。
-                None => (client_start, res.content_length()),
-            };
-            // 上游 206 时字节已从区间起点开始, 无需跳过; 上游 200 时跳过前缀。
-            let skip = if status == 206 { 0 } else { window_start };
-            let (body, truncated) =
-                read_media_bytes(&mut res, skip, MEDIA_CHUNK_LIMIT).await?;
-            if truncated || (skip > 0 && !body.is_empty()) {
-                let total_text = known_total
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "*".to_string());
-                sliced_headers = Some(format!(
-                    "bytes {}-{}/{}",
-                    window_start,
-                    window_start + body.len() as u64 - 1,
-                    total_text
-                ));
+                // 需要自己丢掉前 window_start 字节才是客户端要的区间。
+                None => (client_range_start.unwrap_or(0), res.content_length()),
             }
-            body
         } else {
-            res.bytes()
-                .await
-                .map_err(|e| AppError::Internal(e.into()))?
-                .to_vec()
+            (0, res.content_length())
         };
+        // 上游 206 时字节已从区间起点开始, 无需跳过; 上游 200 时跳过前缀。
+        let skip = if slice_this_request && status != 206 {
+            window_start
+        } else {
+            0
+        };
+
+        // 断流续传: 实测一类 CDN/中转(尤其内地访问境外 TikTok 系 CDN)会在长
+        // 传输中途直接 FIN, reqwest 报 "peer closed connection without sending
+        // TLS close_notify"。读体一旦中断就从"窗口起点 + 已收字节"处以
+        // Range: bytes={offset}- 沿当前生效链路(active_client)重开连接接着读,
+        // 最多 MEDIA_RESUME_MAX 次。闭包按引用捕获 spec/active_client(存活到
+        // 函数结束), reqwest::Client 在每次重连时做廉价 Arc 克隆。
+        let reopen = |start: u64| {
+            let client = active_client.clone();
+            let url = spec.url.clone();
+            let headers = spec.headers.clone();
+            async move {
+                let mut req = client.get(&url);
+                for (name, value) in &headers {
+                    if let (Ok(name), Ok(value)) = (
+                        reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(value),
+                    ) {
+                        req = req.header(name, value);
+                    }
+                }
+                req = req.header(reqwest::header::RANGE, format!("bytes={start}-"));
+                req = req.header(
+                    reqwest::header::ACCEPT_ENCODING,
+                    reqwest::header::HeaderValue::from_static("identity"),
+                );
+                let res = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
+                let resume_status = res.status().as_u16();
+                if !(200..300).contains(&resume_status) {
+                    return Err(AppError::NotFound(format!(
+                        "media resume failed: {resume_status}"
+                    )));
+                }
+                Ok((res, resume_status == 206))
+            }
+        };
+
+        let (body, truncated) = read_media_window(
+            &mut res,
+            skip,
+            window_start,
+            if slice_this_request {
+                MEDIA_CHUNK_LIMIT
+            } else {
+                u64::MAX
+            },
+            &reopen,
+        )
+        .await?;
+        if body.is_empty() {
+            return Err(AppError::NotFound("media body empty".to_string()));
+        }
+        // 整读路径(hls.js 分片等)绝不能交付残缺体: 截断即整单失败, 让调用方
+        // 重试。分块路径则可以把已收字节按真实区间交付(Content-Range 如实)。
+        if truncated && !slice_this_request {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "媒体传输中断且续传失败"
+            )));
+        }
+        let mut sliced_headers: Option<String> = None;
+        if truncated || (skip > 0 && !body.is_empty()) {
+            let total_text = known_total
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "*".to_string());
+            sliced_headers = Some(format!(
+                "bytes {}-{}/{}",
+                window_start,
+                window_start + body.len() as u64 - 1,
+                total_text
+            ));
+        }
+        let bytes = body;
 
         // 被截断/切片过的响应绝不是播放列表(列表只有几 KB, 且这类请求不带
         // Range), 直接按媒体字节回传。
@@ -4525,6 +4613,10 @@ impl BookService {
                     Some(content_range),
                     Some("bytes".to_string()),
                 ),
+                // 客户端没带 Range 而上游按区间回了 206(回环路径强制 bytes=0-
+                // 且文件恰好一块读完): 对客户端回 200 整包语义 —— 206 只应
+                // 回答带 Range 的请求。
+                None if client_range_start.is_none() => (200, None, accept_ranges),
                 None => (status, content_range, accept_ranges),
             };
             return Ok(MediaPayload {
@@ -4545,7 +4637,8 @@ impl BookService {
         Ok(MediaPayload {
             bytes: rewritten.into_bytes(),
             content_type: "application/vnd.apple.mpegurl".to_string(),
-            status,
+            // 回环路径强制 bytes=0- 的场景对客户端回 200(见上)。
+            status: if client_range_start.is_none() { 200 } else { status },
             content_range: None,
             accept_ranges: None,
             is_playlist: true,
@@ -5849,10 +5942,19 @@ pub struct MediaPayload {
 
 /// 单次回传给播放器的媒体字节上限。
 ///
-/// 只对带 Range 头的渐进式拉流请求生效(见 `get_media_for_source`): 起播只需
-/// 一块(4 MiB), 播放器会按需继续拉后续区间; hls.js 的分片请求不带 Range,
-/// 不受影响。
+/// 对渐进式拉流请求生效(见 `get_media_for_source`): 起播只需一块(4 MiB),
+/// 播放器会按需继续拉后续区间。覆盖两类请求: 带 Range 的媒体栈拉流, 以及
+/// 回环路径上不带 Range 的首个请求(上游被强制 `bytes=0-`)。协议路径上
+/// hls.js 的分片请求不带 Range, 保持整读不受影响。
 const MEDIA_CHUNK_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// 单块窗口内的断流续传次数上限: 一块 ≤4 MiB, 3 次续传足以跨过瞬时抖动;
+/// 再多说明链路已不可用, 交给播放器整单重试。
+const MEDIA_RESUME_MAX: u32 = 3;
+
+/// 续传前的退避基数, 按次数线性放大(250/500/750ms), 避免对已经半死的链路
+/// 立刻重连又立刻被拆。
+const MEDIA_RESUME_BACKOFF_MS: u64 = 250;
 
 /// 解析客户端 Range 头的起点: `bytes=100-` / `bytes=100-200` → `Some(100)`。
 ///
@@ -5880,26 +5982,95 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     Some((start, end, total))
 }
 
-/// 从上游响应读取媒体字节, 必要时截断成单块。
+/// 从上游响应读取媒体字节, 必要时截断成单块; 传输中断自动按区间续传。
 ///
 /// 返回 `(字节, 是否截断)`。`skip` 是要丢弃的前置字节数(上游忽略 Range 返回
-/// 整包时, 用它跳到客户端请求的起点); `limit` 是单块上限 —— 到达上限后再探测
-/// 一次流是否还有数据, 恰好整读完(流已结束)不算截断。探测用的那一小块属于
-/// 下一个区间, 丢弃没有影响: 截断时客户端本就会按 Content-Range 继续请求。
-async fn read_media_bytes(
+/// 整包时, 用它跳到客户端请求的起点); `limit` 是单块上限 —— `u64::MAX` 表示
+/// 整读到 EOF; 到达上限后再探测一次流是否还有数据, 恰好整读完(流已结束)不算
+/// 截断。探测用的那一小块属于下一个区间, 丢弃没有影响: 截断时客户端本就会
+/// 按 Content-Range 继续请求。
+///
+/// 实测一类 CDN/中转会在长传输中途直接 FIN(reqwest 报 "peer closed connection
+/// without sending TLS close_notify")。断流时从 `窗口起点 + 已保留字节 +
+/// 已跳过字节` 处调 [`reopen`] 以 `Range: bytes={offset}-` 重开连接接着读,
+/// 最多 [`MEDIA_RESUME_MAX`] 次; 重连本身失败时, 已有字节按截断交付, 一字节
+/// 未得才把错误上抛。`window_start` 是客户端窗口的绝对起点(续传偏移用)。
+async fn read_media_window<F, R>(
     res: &mut reqwest::Response,
     skip: u64,
+    window_start: u64,
     limit: u64,
-) -> Result<(Vec<u8>, bool), AppError> {
-    let cap = limit as usize;
+    reopen: &F,
+) -> Result<(Vec<u8>, bool), AppError>
+where
+    F: Fn(u64) -> R,
+    R: std::future::Future<Output = Result<(reqwest::Response, bool), AppError>>,
+{
+    let cap = if limit == u64::MAX {
+        usize::MAX
+    } else {
+        limit as usize
+    };
     let mut body: Vec<u8> = Vec::new();
     let mut to_skip = skip;
+    let total_skip = skip;
     let mut truncated = false;
-    while !truncated {
+    let mut resumes = 0u32;
+    loop {
         let chunk = match res.chunk().await {
             Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(err) => return Err(AppError::Internal(err.into())),
+            Ok(None) => {
+                // 恰好到达上限且流已结束: 再探一次确认是否真的读完 —— 还能
+                // 读出数据就算截断。探测出错按"可能还有数据"处理, 交给
+                // 客户端续拉, 与旧行为(整读路径)一致。
+                if body.len() == cap {
+                    truncated = matches!(res.chunk().await, Ok(Some(_)));
+                }
+                break;
+            }
+            Err(err) => {
+                // 窗口已满: 按截断交付, 不必续传。
+                if body.len() >= cap {
+                    truncated = true;
+                    break;
+                }
+                if resumes >= MEDIA_RESUME_MAX {
+                    return Err(AppError::Internal(err.into()));
+                }
+                resumes += 1;
+                let next = window_start + (total_skip - to_skip) + body.len() as u64;
+                tracing::warn!(
+                    offset = next,
+                    attempt = resumes,
+                    have = body.len(),
+                    "media stream interrupted; resuming by range"
+                );
+                sleep(Duration::from_millis(
+                    MEDIA_RESUME_BACKOFF_MS * resumes as u64,
+                ))
+                .await;
+                match reopen(next).await {
+                    Ok((fresh, ranged)) => {
+                        *res = fresh;
+                        // 上游按区间回: 字节直接从 next 开始; 忽略区间回整包:
+                        // 重新丢前缀到 next。
+                        to_skip = if ranged { 0 } else { next };
+                    }
+                    Err(reopen_err) => {
+                        // 重连也失败: 有字节就按截断交付, 没字节把原始错误上抛。
+                        if body.is_empty() {
+                            return Err(AppError::Internal(err.into()));
+                        }
+                        tracing::warn!(
+                            error = %reopen_err,
+                            "media resume failed; delivering truncated chunk"
+                        );
+                        truncated = true;
+                        break;
+                    }
+                }
+                continue;
+            }
         };
         if to_skip > 0 {
             let n = chunk.len() as u64;
@@ -5916,17 +6087,16 @@ async fn read_media_bytes(
         if body.len() > cap {
             body.truncate(cap);
             truncated = true;
-        }
-    }
-    // 恰好到达上限且流里还有数据 → 截断; 流恰好结束 → 完整。
-    if body.len() == cap && !truncated {
-        match res.chunk().await {
-            Ok(Some(_)) => truncated = true,
-            Ok(None) => {}
-            Err(err) => return Err(AppError::Internal(err.into())),
+            break;
         }
     }
     Ok((body, truncated))
+}
+
+/// 仅按 URL 判别播放列表(发请求前唯一可用的判据)。
+fn media_url_is_playlist_by_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    path.ends_with(".m3u8")
 }
 
 /// 判断媒体响应是否为 m3u8 播放列表。
@@ -5935,8 +6105,7 @@ async fn read_media_bytes(
 /// 一类站点的分片地址不带 `.m3u8` 后缀(如 `…/manifest.m3u8?t=..&sign=..`
 /// 倒是带的), 但也有把播放列表发成 `application/octet-stream` 的, 魔数兜底。
 fn media_url_is_playlist(url: &str, content_type: Option<&str>, body: &[u8]) -> bool {
-    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
-    if path.ends_with(".m3u8") {
+    if media_url_is_playlist_by_url(url) {
         return true;
     }
     if let Some(ct) = content_type {

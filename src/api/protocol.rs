@@ -66,6 +66,7 @@ async fn route(
                 .headers()
                 .get(http::header::RANGE)
                 .and_then(|v| v.to_str().ok()),
+            false,
         )
         .await,
         "/epub" => epub_route(state, query).await,
@@ -783,10 +784,16 @@ pub async fn img_route(state: &AppState, query: &str) -> tauri::http::Response<V
 /// m3u8 播放列表在 `book_service::get_media_for_source` 里已把分片/密钥 URI
 /// 改写成相对的 `/media?path=...` 链接, 后续分片请求继续落到本路由。
 /// 播放地址带签名时效, 一律 `no-store`, 不进任何缓存。
+///
+/// `slice_unranged`: 是否允许对**不带 Range** 的请求做有界分块回传。协议路径
+/// (reader://)上是 hls.js 的 fetch, 分片/列表被截断会直接破坏解码, 恒传
+/// `false`; 回环 HTTP 路径(`api::media_stream`)上只有 `<video>` 原生媒体栈,
+/// 其首个请求不带 Range, 传 `true` 才能把大直链切成按需拉取的分块。
 pub async fn media_route(
     state: &AppState,
     query: &str,
     range_header: Option<&str>,
+    slice_unranged: bool,
 ) -> tauri::http::Response<Vec<u8>> {
     let params: HashMap<String, String> =
         serde_urlencoded::from_str(query).unwrap_or_default();
@@ -807,20 +814,23 @@ pub async fn media_route(
     // URL 只留 host+path, 签名参数不落日志。
     let started = std::time::Instant::now();
     let log_target = media_log_target(url);
+    let via = if slice_unranged { "loopback" } else { "protocol" };
     tracing::info!(
         target = %log_target,
+        via,
         range = range.as_deref().unwrap_or("-"),
         "media proxy request"
     );
 
     match state
         .book_service
-        .get_media_for_source("public", url, source.as_ref(), range.as_deref())
+        .get_media_for_source("public", url, source.as_ref(), range.as_deref(), slice_unranged)
         .await
     {
         Ok(payload) => {
             tracing::info!(
                 target = %log_target,
+                via,
                 range = range.as_deref().unwrap_or("-"),
                 status = payload.status,
                 content_type = %payload.content_type,
@@ -871,6 +881,7 @@ pub async fn media_route(
         Err(err) => {
             tracing::warn!(
                 target = %log_target,
+                via,
                 range = range.as_deref().unwrap_or("-"),
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 error = %err,

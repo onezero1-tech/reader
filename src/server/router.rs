@@ -621,7 +621,11 @@ async fn media(
     let range = headers
         .get(axum::http::header::RANGE)
         .and_then(|v| v.to_str().ok());
-    from_tauri_response(crate::api::protocol::media_route(&state, &query_string(&uri), range).await)
+    // 协议路径同样保守: 无 Range 的请求可能是 hls.js 的分片/列表 fetch,
+    // 不能截断(浏览器原生 <video> 拉流必带 Range, 走有界切片分支)。
+    from_tauri_response(
+        crate::api::protocol::media_route(&state, &query_string(&uri), range, false).await,
+    )
 }
 
 async fn pdf(State(state): State<AppState>, uri: Uri) -> Response {

@@ -86,7 +86,11 @@ async fn media(
     }
     let query = raw_query.unwrap_or_default();
     let range = headers.get(RANGE).and_then(|v| v.to_str().ok());
-    let proxied = crate::api::protocol::media_route(&state, &query, range).await;
+    // slice_unranged = true: 本路径只有 <video> 原生媒体栈, 其首个媒体请求
+    // 不带 Range —— 后端据此给上游强制 bytes=0- 并按块回传, 直链不再整读
+    // (整读既慢又容易在长传输中被 CDN 掐断)。详见 book_service 注释。
+    let proxied =
+        crate::api::protocol::media_route(&state, &query, range, true).await;
     // 允许任意来源跨域读取: 服务有 token 把门, 且这给未来 HLS 整体迁移到
     // 回环 HTTP(hls.js 的 fetch 需要 CORS)留好路。
     let (parts, body) = proxied.into_parts();
