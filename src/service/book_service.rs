@@ -4516,6 +4516,9 @@ impl BookService {
         let is_playlist = sliced_headers.is_none()
             && media_url_is_playlist(&spec.url, upstream_content_type.as_deref(), &bytes);
         if !is_playlist {
+            // 先取布尔再 move: Some(content_range) 会把 String 移出
+            // sliced_headers, 之后不能再借用它。
+            let sliced = sliced_headers.is_some();
             let (status, content_range, accept_ranges) = match sliced_headers {
                 Some(content_range) => (
                     206u16,
@@ -4532,7 +4535,7 @@ impl BookService {
                 content_range,
                 accept_ranges,
                 is_playlist: false,
-                sliced: sliced_headers.is_some(),
+                sliced,
             });
         }
         // 分片路径必然不是 .m3u8, 这里统一当成播放列表; 扩展名异常的站点靠
