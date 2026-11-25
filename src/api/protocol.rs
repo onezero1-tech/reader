@@ -823,6 +823,8 @@ pub async fn media_route(
                 target = %log_target,
                 range = range.as_deref().unwrap_or("-"),
                 status = payload.status,
+                content_type = %payload.content_type,
+                content_range = payload.content_range.as_deref().unwrap_or("-"),
                 bytes = payload.bytes.len(),
                 sliced = payload.sliced,
                 playlist = payload.is_playlist,
