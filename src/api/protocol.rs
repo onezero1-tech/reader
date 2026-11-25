@@ -801,12 +801,28 @@ pub async fn media_route(
 
     let source = resolve_cover_source(state, params.get("source").map(String::as_str), url).await;
 
+    // 媒体请求全程留痕: 播放卡死时用户日志里必须能看到卡在哪一环
+    // (请求没来 = 前端/正文没到; 来了但 status 非 2xx = 源头 403/404;
+    //  来了但耗时巨大 = 网速慢)。URL 只留 host+path, 签名参数不落日志。
+    let started = std::time::Instant::now();
+    let log_target = media_log_target(url);
+
     match state
         .book_service
         .get_media_for_source("public", url, source.as_ref(), range.as_deref())
         .await
     {
         Ok(payload) => {
+            tracing::info!(
+                target = %log_target,
+                range = range.as_deref().unwrap_or("-"),
+                status = payload.status,
+                bytes = payload.bytes.len(),
+                sliced = payload.sliced,
+                playlist = payload.is_playlist,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "media proxy response"
+            );
             let status = if payload.status == 206 {
                 206
             } else {
@@ -826,8 +842,13 @@ pub async fn media_route(
                     builder = builder.header(http::header::ACCEPT_RANGES, value);
                 }
             }
-            // 播放列表: 地址带签名时效, 必须每次重新拉; 分片字节跟随上游语义。
-            let cache_control = if payload.is_playlist {
+            // 三类都必须禁缓存:
+            // - 播放列表: 地址带签名时效, 必须每次重新拉;
+            // - 分块区间(sliced): 同一 URL 的不同 Range 请求绝不能命中
+            //   同一份缓存 —— 缓存实现若不区分区间, 第二块会拿到第一块
+            //   的字节, 播放器直接卡死;
+            // - 其余分片/直链字节跟随上游语义(max-age=86400)。
+            let cache_control = if payload.is_playlist || payload.sliced {
                 "no-store"
             } else {
                 "max-age=86400"
@@ -839,10 +860,30 @@ pub async fn media_route(
                 .body(payload.bytes)
                 .unwrap_or_else(|_| http::Response::new(Vec::new()))
         }
-        Err(_) => http::Response::builder()
-            .status(404)
-            .body(Vec::new())
-            .unwrap_or_default(),
+        Err(err) => {
+            tracing::warn!(
+                target = %log_target,
+                range = range.as_deref().unwrap_or("-"),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %err,
+                "media proxy failed"
+            );
+            http::Response::builder()
+                .status(404)
+                .body(Vec::new())
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// 日志用的媒体地址: 去掉签名 query 与 fragment, 只留 host+path 并截短。
+fn media_log_target(url: &str) -> String {
+    let bare = url.split(['?', '#']).next().unwrap_or(url);
+    // 按字符截断: URL 可能含中文路径, 按字节切会在非字符边界 panic。
+    if bare.chars().count() <= 120 {
+        bare.to_string()
+    } else {
+        bare.chars().take(120).collect::<String>() + "…"
     }
 }
 

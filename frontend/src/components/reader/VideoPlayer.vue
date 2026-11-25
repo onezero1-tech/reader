@@ -56,6 +56,8 @@ interface SpeedSample {
 let speedSamples: SpeedSample[] = []
 let speedTimer: ReturnType<typeof setInterval> | null = null
 let perfObserver: PerformanceObserver | null = null
+/** 本次 attach 的起始时刻, 用于起播等待计时。 */
+let attachStartedAt = 0
 
 function recordBytes(bytes: number) {
   if (bytes <= 0) return
@@ -110,6 +112,11 @@ function updateStatusText() {
   if (speed !== null) parts.push(`↓ ${formatSpeed(speed)}`)
   const ahead = bufferedAhead(el)
   if (ahead !== null) parts.push(`缓冲 ${Math.round(ahead)}s`)
+  // 起播前(视频栈还没拿到可播放的首帧)速度/缓冲都可能没有采样,
+  // 但用户最需要知道的是"它还在动还是卡死了" —— 显示起播等待秒数。
+  if (loading.value) {
+    parts.push(`起播等待 ${Math.max(0, Math.round((performance.now() - attachStartedAt) / 1000))}s`)
+  }
   statusText.value = parts.join(' · ')
 }
 
@@ -160,6 +167,7 @@ async function attach() {
   hint.value = ''
   loading.value = true
   const gen = ++generation
+  attachStartedAt = performance.now()
   startStatusTimer()
 
   if (props.kind === 'mp4') {
@@ -249,6 +257,24 @@ function retry() {
   emit('reload')
 }
 
+/**
+ * <video> 的网络层错误。
+ *
+ * 旧实现只把 spinner 关掉, 用户看到的是黑屏无提示 —— "一直加载"的另一半
+ * 场景其实是"早就报错但没人看见"。这里把错误暴露成可见的重试入口。
+ *
+ * 注意: destroy() 里 removeAttribute('src') + load() 也会触发 error 事件,
+ * 没有 src 属性时忽略 —— 那是卸载/换源的副作用, 不是真错误。
+ */
+function onVideoError() {
+  const el = videoRef.value
+  if (!el || !el.getAttribute('src')) return
+  loading.value = false
+  failed.value = true
+  statusText.value = ''
+  hint.value = '视频加载失败（地址失效或网络异常），请点击重试'
+}
+
 watch(() => props.src, attach, { immediate: true })
 onBeforeUnmount(destroy)
 </script>
@@ -264,13 +290,14 @@ onBeforeUnmount(destroy)
         class="player-video"
         @ended="emit('ended')"
         @canplay="loading = false"
-        @error="loading = false"
+        @error="onVideoError"
       ></video>
       <div v-if="loading && !failed" class="player-loading">
         <span class="player-spinner" aria-hidden="true"></span>
         <span>正在加载视频…</span>
       </div>
-      <div v-if="statusText && !failed && !loading" class="player-status">{{ statusText }}</div>
+      <!-- 诊断条: 加载中也显示(起播等待/速度/缓冲), 便于判断卡死还是网速慢 -->
+      <div v-if="statusText && !failed" class="player-status">{{ statusText }}</div>
       <div v-if="failed" class="player-error">
         <p>{{ hint || '视频加载失败' }}</p>
         <button type="button" class="player-retry" @click="retry">重试</button>

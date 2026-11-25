@@ -4532,6 +4532,7 @@ impl BookService {
                 content_range,
                 accept_ranges,
                 is_playlist: false,
+                sliced: sliced_headers.is_some(),
             });
         }
         // 分片路径必然不是 .m3u8, 这里统一当成播放列表; 扩展名异常的站点靠
@@ -4545,6 +4546,7 @@ impl BookService {
             content_range: None,
             accept_ranges: None,
             is_playlist: true,
+            sliced: false,
         })
     }
 
@@ -5836,6 +5838,10 @@ pub struct MediaPayload {
     pub accept_ranges: Option<String>,
     /// true = 播放列表(已改写分片地址), false = 媒体分片/文件字节。
     pub is_playlist: bool,
+    /// true = 本次响应是被截断/切片的单块区间(带客户端请求的其它 Range 时
+    /// 还会有后续请求)。这类响应禁止缓存 —— 同一 URL 的不同区间请求
+    /// 绝不能命中同一份缓存。
+    pub sliced: bool,
 }
 
 /// 单次回传给播放器的媒体字节上限。
