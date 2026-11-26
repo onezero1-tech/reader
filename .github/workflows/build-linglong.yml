@@ -309,7 +309,6 @@ jobs:
             -shared -fPIC scripts/redirect_vartmp.c -o libredirect_vartmp.so -ldl
           # 校验符号表最高 GLIBC 版本不超过 2.35
           maxver=$(objdump -T libredirect_vartmp.so \
-
             | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1 | cut -d_ -f2 || true)
           echo "libredirect_vartmp.so max GLIBC symbol version: ${maxver:-none}"
           if [ -n "$maxver" ] && [ "$(printf '%s\n' 2.35 "$maxver" | sort -V | tail -1)" != "2.35" ]; then
