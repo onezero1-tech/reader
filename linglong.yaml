@@ -76,13 +76,26 @@ build: |
   install -Dm755 /project/reader-desktop $PREFIX/bin/reader
 
   # ---------- 3. 启动脚本 ----------
-  # 托盘库装在应用自己的 usr/lib 下，启动时补进 LD_LIBRARY_PATH；
-  # webkit 等其余依赖由 runtime 层自动提供，无需任何路径 hack。
+  # 托盘库装在应用自己的 usr/lib 下，启动时补进 LD_LIBRARY_PATH。
+  # /runtime/lib/x86_64-linux-gnu 必须显式加入：GStreamer 插件
+  # (libgstlibav.so 等, 位于 /runtime/.../gstreamer-1.0/) 是运行时 dlopen 的,
+  # 其依赖(libavcodec.so.60 / libavutil.so.58 等)在 /runtime/lib 下; 容器里
+  # WebKitWebProcess 的 LD_LIBRARY_PATH 只有应用自己的目录, 插件 dlopen 时
+  # 依赖解析不到 → 全部插件加载失败 → 注册表为空 → <video> 秒报
+  # SRC_NOT_SUPPORTED(error 4) 且无任何 GStreamer 日志(1.6.8.0 实测)。
+  # 同时消除 base 层 gstreamer 支持库(1.24.13)与 runtime(1.24.6) 混载。
   startScript="$PREFIX/bin/start-reader"
   echo '#!/bin/sh' > "$startScript"
   echo 'APPDIR=/opt/apps/com.hadc188.reader/files' >> "$startScript"
-  echo 'export LD_LIBRARY_PATH="$APPDIR/usr/lib/x86_64-linux-gnu:$APPDIR/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"' >> "$startScript"
+  echo 'export LD_LIBRARY_PATH="$APPDIR/usr/lib/x86_64-linux-gnu:$APPDIR/lib/x86_64-linux-gnu:/runtime/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"' >> "$startScript"
   echo 'export WEBKIT_DISABLE_DMABUF_RENDERER=1' >> "$startScript"
+  # 独立注册表: 容器与宿主 deepin 共享 ~/.cache, 两侧 gstreamer 版本不同
+  # (runtime 1.24.6 / 宿主 1.24.13), 共用 registry.x86_64.bin 会互相判定
+  # 版本不符触发全量重扫、互相覆盖, 各用各的注册表文件最稳。
+  echo 'export GST_REGISTRY="${XDG_CACHE_HOME:-$HOME/.cache}/gstreamer-1.0/reader-registry.bin"' >> "$startScript"
+  # 调试钩子: touch ~/reader-gst-debug 后重启应用即开 GST_DEBUG=3。
+  # ll-cli run 不透传外部环境变量, GST_DEBUG 只能从启动脚本内部注入。
+  echo 'if [ -e "$HOME/reader-gst-debug" ]; then export GST_DEBUG=3 GST_DEBUG_NO_COLOR=1; fi' >> "$startScript"
   echo 'exec "$APPDIR/bin/reader"' >> "$startScript"
   chmod +x "$startScript"
 

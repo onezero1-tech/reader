@@ -52,7 +52,7 @@ env:
   # 情况 A：写死 commit sha；情况 B：改成 main / master 跟踪分支
   READER_REF: main
   # 情况 C：发新版本时只改这里（会被 sed 注入 linglong.yaml 的 package.version）
-  APP_VERSION: 1.6.8.0
+  APP_VERSION: 1.6.9.0
   XDG_RUNTIME_DIR: /run/user/1001
 
 jobs:
@@ -84,9 +84,11 @@ jobs:
         with:
           path: stage/
           # 注意：不要加 restore-keys，否则新代码会回退到旧二进制
-          # v2 前缀：换 cargo-zigbuild（glibc 2.35）编译后强制丢弃旧 key 下的
-          # glibc 2.39 产物，防止命中旧缓存导致 GLIBC 警告复现
-          key: reader-desktop-binary-v2-${{ env.SOURCE_SHA }}
+          # v3 前缀：key 从整仓 commit sha 改为源码内容哈希 —— 打包文件
+          # (linglong.yaml / .github) 的提交不再触发 20-40 分钟全量重编，
+          # 只有 src/ frontend/ desktop/ 或依赖清单变化才重新编译。
+          # (v2 时代改一行 yaml 也要重编; v3 前缀同时避免复用旧 key 产物)
+          key: reader-desktop-binary-v3-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'src/**', 'frontend/src/**', 'frontend/public/**', 'frontend/index.html', 'frontend/package*.json', 'desktop/**') }}
 
       - name: Validate staged files
         id: staged
