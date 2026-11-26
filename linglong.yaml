@@ -26,11 +26,11 @@ base: org.deepin.base/25.2.2
 #
 # 注意两个事实（都已实测核实）：
 # 1) 该 runtime 只在社区测试源 cdn-linglong.odata.cc 上，官方镜像
-#    mirror-repo-linglong.deepin.com 的 15716 个 ref 中没有任何 runtime.gtk4。
+#    ://deepin.com 的 15716 个 ref 中没有任何 runtime.gtk4。
 # 2) CI 打包用 ll-killer layer build（verge-rev 同款），构建期完全不拉取
 #    base/runtime，所以构建侧不需要配社区源；但终端用户安装时 ll-cli 仍要
 #    解析本 runtime，需先执行：
-#      ll-cli repo add community https://cdn-linglong.odata.cc
+#      ll-cli repo add community https://odata.cc
 runtime: org.deepin.runtime.gtk4/25.2.2
 
 # runtime 缺两类库（debs.txt 共 8 个 deb，宿主机 prepare_payload.sh 解包到
@@ -52,6 +52,7 @@ build: |
   set -e
 
   test -f /project/reader-desktop || { echo "ERROR: /project/reader-desktop missing"; ls -la /project; exit 1; }
+  test -f /project/libredirect_vartmp.so || { echo "ERROR: /project/libredirect_vartmp.so missing"; ls -la /project; exit 1; }
   test -f /project/icons/128x128.png || { echo "ERROR: /project/icons missing"; exit 1; }
   test -d /project/payload/usr || { echo "ERROR: /project/payload missing (prepare_payload.sh 未执行?)"; ls -la /project; exit 1; }
 
@@ -72,8 +73,9 @@ build: |
   # deepin deb 是 usr-merged 布局，库在 payload/usr/lib/x86_64-linux-gnu/
   cp -rP /project/payload/usr/. $PREFIX/
 
-  # ---------- 2. 安装主程序（预编译产物） ----------
+  # ---------- 2. 安装主程序与路径重定向垫片库 ----------
   install -Dm755 /project/reader-desktop $PREFIX/bin/reader
+  install -Dm755 /project/libredirect_vartmp.so $PREFIX/lib/libredirect_vartmp.so
 
   # ---------- 3. 启动脚本 ----------
   # 托盘库装在应用自己的 usr/lib 下，启动时补进 LD_LIBRARY_PATH。
@@ -88,6 +90,9 @@ build: |
   echo '#!/bin/sh' > "$startScript"
   echo 'APPDIR=/opt/apps/com.hadc188.reader/files' >> "$startScript"
   echo 'export LD_LIBRARY_PATH="$APPDIR/usr/lib/x86_64-linux-gnu:$APPDIR/lib/x86_64-linux-gnu:/runtime/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"' >> "$startScript"
+  # 拦截 WebKitGTK GStreamer downloadbuffer 硬编码的 /var/tmp/WebKit-Media-XXXXXX 写入，重定向至容器内可写的 /tmp
+  echo 'export TMPDIR=/tmp' >> "$startScript"
+  echo 'export LD_PRELOAD="$APPDIR/lib/libredirect_vartmp.so${LD_PRELOAD:+:$LD_PRELOAD}"' >> "$startScript"
   echo 'export WEBKIT_DISABLE_DMABUF_RENDERER=1' >> "$startScript"
   # 独立注册表: 容器与宿主 deepin 共享 ~/.cache, 两侧 gstreamer 版本不同
   # (runtime 1.24.6 / 宿主 1.24.13), 共用 registry.x86_64.bin 会互相判定
@@ -96,7 +101,7 @@ build: |
   # 调试钩子: touch ~/reader-gst-debug 后重启应用即开 GST_DEBUG=3。
   # ll-cli run 不透传外部环境变量, GST_DEBUG 只能从启动脚本内部注入。
   echo 'if [ -e "$HOME/reader-gst-debug" ]; then export GST_DEBUG=3 GST_DEBUG_NO_COLOR=1; fi' >> "$startScript"
-  echo 'exec "$APPDIR/bin/reader"' >> "$startScript"
+  echo 'exec "$APPDIR/bin/reader" "$@"' >> "$startScript"
   chmod +x "$startScript"
 
   # ---------- 4. 图标与桌面入口 ----------
