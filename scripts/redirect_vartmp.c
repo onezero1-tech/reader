@@ -1,101 +1,162 @@
-// scripts/redirect_vartmp.c
 #define _GNU_SOURCE
 #include <dlfcn.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-static const char *OLD_PREFIX = "/var/tmp/WebKit-Media-";
-static const char *NEW_PREFIX = "/tmp/WebKit-Media-";
+#define OLD_PREFIX "/var/tmp/"
+#define OLD_LEN 9
 
-// 1. 拦截 mkstemp（GStreamer downloadbuffer / g_mkstemp 最常调用）
-int mkstemp(char *template) {
-    static int (*real_mkstemp)(char *) = NULL;
-    if (!real_mkstemp) real_mkstemp = dlsym(RTLD_NEXT, "mkstemp");
+static const char *get_new_dir(void) {
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    if (dir && dir[0] == '/') return dir;
+    dir = getenv("TMPDIR");
+    if (dir && dir[0] == '/') return dir;
+    return "/tmp";
+}
 
-    if (template && strncmp(template, OLD_PREFIX, strlen(OLD_PREFIX)) == 0) {
-        char buf[512];
-        snprintf(buf, sizeof(buf), "%s%s", NEW_PREFIX, template + strlen(OLD_PREFIX));
-        // "/tmp/" 比 "/var/tmp/" 短 4 字节，原地覆盖绝对安全
-        strcpy(template, buf);
+static char *rewrite_path(const char *path) {
+    if (!path || strncmp(path, OLD_PREFIX, OLD_LEN) != 0) {
+        return NULL;
     }
-    return real_mkstemp(template);
+    const char *new_dir = get_new_dir();
+    size_t len = strlen(new_dir) + 1 + strlen(path + OLD_LEN) + 1;
+    char *buf = malloc(len);
+    if (buf) {
+        snprintf(buf, len, "%s/%s", new_dir, path + OLD_LEN);
+    }
+    return buf;
+}
+
+static void sync_template(char *orig, const char *rewritten) {
+    // 保留随机生成的后 6 位字符，避免调用方依赖模板内容
+    size_t orig_len = strlen(orig);
+    size_t new_len = strlen(rewritten);
+    if (orig_len >= 6 && new_len >= 6) {
+        memcpy(orig + orig_len - 6, rewritten + new_len - 6, 6);
+    }
+}
+
+int mkstemp(char *template) {
+    static int (*real_fn)(char *) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "mkstemp");
+    char *new_path = rewrite_path(template);
+    if (new_path) {
+        int fd = real_fn(new_path);
+        sync_template(template, new_path);
+        free(new_path);
+        return fd;
+    }
+    return real_fn(template);
 }
 
 int mkstemp64(char *template) {
-    static int (*real_mkstemp64)(char *) = NULL;
-    if (!real_mkstemp64) real_mkstemp64 = dlsym(RTLD_NEXT, "mkstemp64");
-
-    if (template && strncmp(template, OLD_PREFIX, strlen(OLD_PREFIX)) == 0) {
-        char buf[512];
-        snprintf(buf, sizeof(buf), "%s%s", NEW_PREFIX, template + strlen(OLD_PREFIX));
-        strcpy(template, buf);
+    static int (*real_fn)(char *) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "mkstemp64");
+    char *new_path = rewrite_path(template);
+    if (new_path) {
+        int fd = real_fn(new_path);
+        sync_template(template, new_path);
+        free(new_path);
+        return fd;
     }
-    return real_mkstemp64(template);
+    return real_fn(template);
 }
 
-// 2. 兜底拦截 open / open64 / openat（防止直接调用 open 创建缓冲文件）
+int mkostemp(char *template, int flags) {
+    static int (*real_fn)(char *, int) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "mkostemp");
+    char *new_path = rewrite_path(template);
+    if (new_path) {
+        int fd = real_fn(new_path, flags);
+        sync_template(template, new_path);
+        free(new_path);
+        return fd;
+    }
+    return real_fn(template, flags);
+}
+
+int mkostemp64(char *template, int flags) {
+    static int (*real_fn)(char *, int) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "mkostemp64");
+    char *new_path = rewrite_path(template);
+    if (new_path) {
+        int fd = real_fn(new_path, flags);
+        sync_template(template, new_path);
+        free(new_path);
+        return fd;
+    }
+    return real_fn(template, flags);
+}
+
 int open(const char *pathname, int flags, ...) {
-    static int (*real_open)(const char *, int, ...) = NULL;
-    if (!real_open) real_open = dlsym(RTLD_NEXT, "open");
-
-    char buf[512];
-    const char *target = pathname;
-    if (pathname && strncmp(pathname, OLD_PREFIX, strlen(OLD_PREFIX)) == 0) {
-        snprintf(buf, sizeof(buf), "%s%s", NEW_PREFIX, pathname + strlen(OLD_PREFIX));
-        target = buf;
+    static int (*real_fn)(const char *, int, ...) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "open");
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
     }
-
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode_t mode = va_arg(args, mode_t);
-        va_end(args);
-        return real_open(target, flags, mode);
-    }
-    return real_open(target, flags);
+    char *new_path = rewrite_path(pathname);
+    const char *target = new_path ? new_path : pathname;
+    int fd = (flags & (O_CREAT | O_TMPFILE)) ? real_fn(target, flags, mode) : real_fn(target, flags);
+    free(new_path);
+    return fd;
 }
 
 int open64(const char *pathname, int flags, ...) {
-    static int (*real_open64)(const char *, int, ...) = NULL;
-    if (!real_open64) real_open64 = dlsym(RTLD_NEXT, "open64");
-
-    char buf[512];
-    const char *target = pathname;
-    if (pathname && strncmp(pathname, OLD_PREFIX, strlen(OLD_PREFIX)) == 0) {
-        snprintf(buf, sizeof(buf), "%s%s", NEW_PREFIX, pathname + strlen(OLD_PREFIX));
-        target = buf;
+    static int (*real_fn)(const char *, int, ...) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "open64");
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
     }
-
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode_t mode = va_arg(args, mode_t);
-        va_end(args);
-        return real_open64(target, flags, mode);
-    }
-    return real_open64(target, flags);
+    char *new_path = rewrite_path(pathname);
+    const char *target = new_path ? new_path : pathname;
+    int fd = (flags & (O_CREAT | O_TMPFILE)) ? real_fn(target, flags, mode) : real_fn(target, flags);
+    free(new_path);
+    return fd;
 }
 
 int openat(int dirfd, const char *pathname, int flags, ...) {
-    static int (*real_openat)(int, const char *, int, ...) = NULL;
-    if (!real_openat) real_openat = dlsym(RTLD_NEXT, "openat");
-
-    char buf[512];
-    const char *target = pathname;
-    if (pathname && strncmp(pathname, OLD_PREFIX, strlen(OLD_PREFIX)) == 0) {
-        snprintf(buf, sizeof(buf), "%s%s", NEW_PREFIX, pathname + strlen(OLD_PREFIX));
-        target = buf;
+    static int (*real_fn)(int, const char *, int, ...) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "openat");
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
     }
+    char *new_path = rewrite_path(pathname);
+    const char *target = new_path ? new_path : pathname;
+    int fd = (flags & (O_CREAT | O_TMPFILE)) ? real_fn(dirfd, target, flags, mode) : real_fn(dirfd, target, flags);
+    free(new_path);
+    return fd;
+}
 
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode_t mode = va_arg(args, mode_t);
-        va_end(args);
-        return real_openat(dirfd, target, flags, mode);
-    }
-    return real_openat(dirfd, target, flags);
+int unlink(const char *pathname) {
+    static int (*real_fn)(const char *) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "unlink");
+    char *new_path = rewrite_path(pathname);
+    int ret = real_fn(new_path ? new_path : pathname);
+    free(new_path);
+    return ret;
+}
+
+int unlinkat(int dirfd, const char *pathname, int flags) {
+    static int (*real_fn)(int, const char *, int) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "unlinkat");
+    char *new_path = rewrite_path(pathname);
+    int ret = real_fn(dirfd, new_path ? new_path : pathname, flags);
+    free(new_path);
+    return ret;
 }
