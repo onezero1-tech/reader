@@ -16,7 +16,7 @@ int mkstemp(char *template) {
     if (!real_mkstemp) real_mkstemp = dlsym(RTLD_NEXT, "mkstemp");
 
     if (template && strncmp(template, OLD_PREFIX, strlen(OLD_PREFIX)) == 0) {
-        char buf;
+        char buf[512];
         snprintf(buf, sizeof(buf), "%s%s", NEW_PREFIX, template + strlen(OLD_PREFIX));
         // "/tmp/" 比 "/var/tmp/" 短 4 字节，原地覆盖绝对安全
         strcpy(template, buf);
@@ -29,7 +29,7 @@ int mkstemp64(char *template) {
     if (!real_mkstemp64) real_mkstemp64 = dlsym(RTLD_NEXT, "mkstemp64");
 
     if (template && strncmp(template, OLD_PREFIX, strlen(OLD_PREFIX)) == 0) {
-        char buf;
+        char buf[512];
         snprintf(buf, sizeof(buf), "%s%s", NEW_PREFIX, template + strlen(OLD_PREFIX));
         strcpy(template, buf);
     }
@@ -41,7 +41,7 @@ int open(const char *pathname, int flags, ...) {
     static int (*real_open)(const char *, int, ...) = NULL;
     if (!real_open) real_open = dlsym(RTLD_NEXT, "open");
 
-    char buf;
+    char buf[512];
     const char *target = pathname;
     if (pathname && strncmp(pathname, OLD_PREFIX, strlen(OLD_PREFIX)) == 0) {
         snprintf(buf, sizeof(buf), "%s%s", NEW_PREFIX, pathname + strlen(OLD_PREFIX));
@@ -62,7 +62,7 @@ int open64(const char *pathname, int flags, ...) {
     static int (*real_open64)(const char *, int, ...) = NULL;
     if (!real_open64) real_open64 = dlsym(RTLD_NEXT, "open64");
 
-    char buf;
+    char buf[512];
     const char *target = pathname;
     if (pathname && strncmp(pathname, OLD_PREFIX, strlen(OLD_PREFIX)) == 0) {
         snprintf(buf, sizeof(buf), "%s%s", NEW_PREFIX, pathname + strlen(OLD_PREFIX));
@@ -83,7 +83,7 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
     static int (*real_openat)(int, const char *, int, ...) = NULL;
     if (!real_openat) real_openat = dlsym(RTLD_NEXT, "openat");
 
-    char buf;
+    char buf[512];
     const char *target = pathname;
     if (pathname && strncmp(pathname, OLD_PREFIX, strlen(OLD_PREFIX)) == 0) {
         snprintf(buf, sizeof(buf), "%s%s", NEW_PREFIX, pathname + strlen(OLD_PREFIX));
