@@ -37,6 +37,7 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
     tauri::generate_handler![
         commands::health,
         commands::media_stream::media_stream_base,
+        commands::media_stream::report_media_error,
         commands::backup::export_local_books,
         commands::backup::import_local_books,
         commands::backup::export_custom_fonts,

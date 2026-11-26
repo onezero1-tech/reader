@@ -55,6 +55,19 @@ build: |
   test -f /project/icons/128x128.png || { echo "ERROR: /project/icons missing"; exit 1; }
   test -d /project/payload/usr || { echo "ERROR: /project/payload missing (prepare_payload.sh 未执行?)"; ls -la /project; exit 1; }
 
+  # ---------- 0) payload 自检(与 CI 的 Verify payload 一致) ----------
+  # 本地 ll-killer 构建不经过 CI 的硬校验, 过期的 payload/ 目录(只有托盘库)
+  # 也能通过上面的 test -d。缺 libblas.so.3 时 runtime 层的 libgstlibav.so
+  # (mp4/H.264 主力软解)加载失败, <video> 播放永远转圈/失败 —— 在这里就
+  # 大声失败, 不打出缺库的包。debs.txt 更新后需重新执行:
+  #   bash prepare_payload.sh debs.txt payload
+  test -f /project/payload/usr/lib/x86_64-linux-gnu/libblas.so.3 \
+    || { echo "ERROR: payload 缺 libblas.so.3 (gst libav 解码依赖)。请在仓库根目录重新执行: bash prepare_payload.sh debs.txt payload"; exit 1; }
+  test -f /project/payload/usr/lib/x86_64-linux-gnu/liblapack.so.3 \
+    || { echo "ERROR: payload 缺 liblapack.so.3 (gst libav 解码依赖)"; exit 1; }
+  test -f /project/payload/usr/lib/x86_64-linux-gnu/libgfortran.so.5 \
+    || { echo "ERROR: payload 缺 libgfortran.so.5 (liblapack3 依赖)"; exit 1; }
+
   # ---------- 1. 拷贝托盘库（runtime 未含的少量依赖）到 $PREFIX ----------
   # deepin deb 是 usr-merged 布局，库在 payload/usr/lib/x86_64-linux-gnu/
   cp -rP /project/payload/usr/. $PREFIX/

@@ -14,7 +14,9 @@
  * 不需要用户手动清理缓存。
  */
 import { onBeforeUnmount, ref, watch } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { toLoopbackMediaUrl } from '../../api/mediaStream'
+import { isTauriRuntime } from '../../api/transport'
 
 const props = defineProps<{
   /** 已代理(/media)的播放地址。 */
@@ -238,6 +240,11 @@ async function attach() {
       }
       failed.value = true
       hint.value = '视频加载失败，请点击重试'
+      reportMediaError(
+        'hls.js',
+        null,
+        `${data.type}/${data.details}${data.fatal ? ' (fatal)' : ''}`,
+      )
       hls.destroy()
       if (hlsInstance === hls) hlsInstance = null
     })
@@ -272,6 +279,24 @@ function retry() {
 }
 
 /**
+ * 把前端媒体错误回传后端 tracing(report_media_error 命令)。
+ *
+ * 发布版(玲珑包)里 WebView console 没有出口, `ll-cli run` 的 stdout 看不到
+ * 前端日志 —— 不回传的话, 播放失败的日志里只剩代理 200, 病因(缺解码器/
+ * 渲染失败)全部丢失。非 Tauri 环境(浏览器)静默跳过。
+ */
+function reportMediaError(player: string, code: number | null, message: string) {
+  if (!isTauriRuntime()) return
+  const el = videoRef.value
+  void invoke('report_media_error', {
+    player,
+    code,
+    message,
+    src: el?.getAttribute('src') || props.src || '',
+  }).catch(() => {})
+}
+
+/**
  * <video> 的网络层错误。
  *
  * 旧实现只把 spinner 关掉, 用户看到的是黑屏无提示 —— "一直加载"的另一半
@@ -283,6 +308,7 @@ function retry() {
  * el.error.message 会携带 WebView 底层的原始描述, 例如 WebKitGTK 在运行时
  * 缺 GStreamer 解码器时报 "Your GStreamer installation is missing a plug-in",
  * 把它透出比笼统的"网络异常"有用得多 —— 用户直接知道该装解码器。
+ * 同时回传后端日志(reportMediaError), 让 ll-cli run 的日志也能自证病因。
  */
 function onVideoError() {
   const el = videoRef.value
@@ -292,6 +318,7 @@ function onVideoError() {
   statusText.value = ''
   const detail = el.error?.message?.trim()
   if (detail) console.warn('[VideoPlayer] media error:', el.error?.code, detail)
+  reportMediaError('video', el.error?.code ?? null, detail || '')
   hint.value = detail
     ? `视频加载失败: ${detail}（点击重试）`
     : '视频加载失败（地址失效或网络异常），请点击重试'
