@@ -299,6 +299,26 @@ jobs:
           cp staged/icons/icon.png    icons/icon.png
           ls -la reader-desktop icons/
 
+      - name: Build libredirect_vartmp.so (glibc 2.35)
+        run: |
+          test -f scripts/redirect_vartmp.c || { echo "ERROR: redirect_vartmp.c missing"; exit 1; }
+          python3 -m venv /tmp/zig-shim-venv
+          /tmp/zig-shim-venv/bin/pip install --quiet ziglang
+          /tmp/zig-shim-venv/bin/python -m ziglang cc \
+            -target x86_64-linux-gnu.2.35 \
+            -shared -fPIC scripts/redirect_vartmp.c -o libredirect_vartmp.so -ldl
+          # 校验符号表最高 GLIBC 版本不超过 2.35
+          maxver=$(objdump -T libredirect_vartmp.so \
+
+            | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1 | cut -d_ -f2 || true)
+          echo "libredirect_vartmp.so max GLIBC symbol version: ${maxver:-none}"
+          if [ -n "$maxver" ] && [ "$(printf '%s\n' 2.35 "$maxver" | sort -V | tail -1)" != "2.35" ]; then
+            echo "FAIL: libredirect_vartmp.so 需要 GLIBC $maxver，超过目标 2.35"
+            exit 1
+          fi
+
+          
+
       - name: Restore tray payload
         id: payload-cache
         uses: actions/cache@v4
