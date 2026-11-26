@@ -4646,6 +4646,211 @@ impl BookService {
         })
     }
 
+    /// 视频源正文(流式): 回环 HTTP 媒体服务专用, 与 [`Self::get_media_for_source`]
+    /// 同一上游语义(书源 headers/UA/防盗链/代理直连回退/断流续传), 但不整读
+    /// 上游 —— 响应体以字节流逐块转发给播放器。
+    ///
+    /// 为什么整读路径的分块 206 不够: `<video>` 的首个媒体请求**不带 Range**,
+    /// 对这种请求回 206 + 单块 body 违反 HTTP 语义(206 只应回答带 Range 的
+    /// 请求), WebKit 的 soup 栈拿到"长度与语义都对不上"的响应后直接放弃 ——
+    /// 实测第一块 4MiB 成功回传后播放器再无后续请求, 依旧转圈。真流式给无
+    /// Range 请求回**标准 200 + Content-Length(全文件长度)**, 边收边转, 与
+    /// 普通视频网站行为完全一致; 带 Range 的请求(嗅探/拖进度条)回 206 +
+    /// Content-Range 流式区间。
+    ///
+    /// 断流自愈不依赖客户端重试: 上游中断时由后端按已转发的绝对偏移
+    /// `Range: bytes={offset}-` 重开连接无缝续传(播放器视角仍是同一条响应),
+    /// 预算见 [`MEDIA_STREAM_RESUME_MAX`]。总超时以单请求上限
+    /// [`MEDIA_STREAM_REQUEST_CAP_SECS`] 兑底, 读空闲仍由 client 的 60s
+    /// read_timeout 触发续传。
+    pub async fn get_media_stream_for_source(
+        &self,
+        user_ns: &str,
+        raw_url: &str,
+        source: Option<&BookSource>,
+        range_header: Option<&str>,
+    ) -> Result<MediaStreamPayload, AppError> {
+        let raw_url = raw_url.trim();
+        // 与整读路径同一套 analyze_url 语义(见 get_media_for_source)。
+        let spec = match source {
+            Some(source) => {
+                let raw = raw_url.to_string();
+                let base = source.book_source_url.clone();
+                self.run_source_task(user_ns, source, move |source| {
+                    analyze_url(&raw, "", 1, &base, source)
+                })
+                .await?
+                .map_err(|err| AppError::BadRequest(format!("媒体地址解析失败: {err}")))?
+            }
+            None => analyze_url(raw_url, "", 1, raw_url, &BookSource::default())
+                .map_err(|err| AppError::BadRequest(format!("媒体地址解析失败: {err}")))?,
+        };
+
+        let source_url = source
+            .map(|s| s.book_source_url.clone())
+            .unwrap_or_default();
+        let context = self
+            .http
+            .source_context(user_ns, &source_url, None)
+            .map_err(AppError::Internal)?;
+
+        let client_range_start = parse_range_start(range_header);
+        let deliver_start = client_range_start.unwrap_or(0);
+        let explicit_end = parse_range_end(range_header);
+
+        let build_request = |client: &reqwest::Client| {
+            let mut req = client.get(&spec.url);
+            for (name, value) in &spec.headers {
+                if let (Ok(name), Ok(value)) = (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(value),
+                ) {
+                    req = req.header(name, value);
+                }
+            }
+            // 无 Range 的客户端请求同样强制 bytes=0-: 上游 206 会带
+            // Content-Range 总长, 据此才能给播放器回准确的 Content-Length。
+            let upstream_range = client_range_start
+                .map(|s| format!("bytes={s}-"))
+                .unwrap_or_else(|| "bytes=0-".to_string());
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&upstream_range) {
+                req = req.header(reqwest::header::RANGE, value);
+            }
+            // 同整读路径: 显式 identity, 绕开一类 CDN 对压缩大文件中途重置
+            // 流的缺陷。
+            req = req.header(
+                reqwest::header::ACCEPT_ENCODING,
+                reqwest::header::HeaderValue::from_static("identity"),
+            );
+            // 覆盖 client 级总超时(60s): 渐进式传输以分钟计, 单请求上限
+            // 放宽到 MEDIA_STREAM_REQUEST_CAP_SECS, 读空闲仍归 read_timeout 管。
+            req = req.timeout(Duration::from_secs(MEDIA_STREAM_REQUEST_CAP_SECS));
+            req
+        };
+
+        let mut send = build_request(&context.client).send().await;
+        if send.is_err() {
+            // 连接阶段抖动(握手被重置等)重试一次, 与代理被拦的直连回退互补。
+            sleep(Duration::from_millis(300)).await;
+            send = build_request(&context.client).send().await;
+        }
+        let retry_status = match &send {
+            Ok(response) => Some(response.status().as_u16()),
+            Err(_) => None,
+        };
+        // 断流续传要沿"当前生效的链路"重开连接(与整读路径一致)。
+        let mut active_client = context.client.clone();
+        if cover_needs_direct_retry(context.proxy.is_some(), retry_status) {
+            if let Ok(direct) = self.http.source_context_direct(user_ns, &source_url) {
+                if let Ok(direct_res) = build_request(&direct.client).send().await {
+                    if direct_res.status().is_success() {
+                        tracing::info!(url = %spec.url, "proxy media stream blocked; used direct retry");
+                        active_client = direct.client.clone();
+                        send = Ok(direct_res);
+                    }
+                }
+            }
+        }
+        let mut res = send.map_err(|e| AppError::Internal(e.into()))?;
+        let status = res.status().as_u16();
+        if !(200..300).contains(&status) {
+            // 2xx 之外(403 签名过期/404 下架)无需读体: 错误直接上抛,
+            // 播放器据此走 forceRefresh 重取正文拿新签名地址。
+            return Err(AppError::NotFound(format!("media fetch failed: {status}")));
+        }
+        let upstream_content_type = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let upstream_content_range = res
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let upstream_accept_ranges = res
+            .headers()
+            .get(reqwest::header::ACCEPT_RANGES)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        // 上游实际的数据起点与总长: 206 时以 Content-Range 为准(可能与请求
+        // 起点不同, 需要丢前缀对齐); 200 整包时从 0 开始。
+        let (upstream_start, total) = if status == 206 {
+            match upstream_content_range.as_deref().and_then(parse_content_range) {
+                Some((s, _e, t)) => (s, t),
+                None => (0, None),
+            }
+        } else {
+            (0, res.content_length())
+        };
+        if status == 206 && upstream_start > deliver_start {
+            // 上游回的区间起点在请求起点之后: 中间缺了一段, 无法无缝交付,
+            // 直接失败让播放器整单重试。
+            return Err(AppError::NotFound(format!(
+                "media upstream range misaligned: asked {deliver_start}, got {upstream_start}"
+            )));
+        }
+        let initial_skip = deliver_start - upstream_start;
+
+        // 本次要交付的字节数上限:
+        // - bytes=N-M: M-N+1;
+        // - 开放区间(bytes=N-): 总长已知则到文件尾, 未知则退化为单块窗口
+        //   (Content-Range 的 end 必须是确定值, 不能用 *); 
+        // - 无 Range: 总长已知则整文件, 未知则流到上游 EOF(chunked)。
+        let remaining: Option<u64> = match explicit_end {
+            Some(end) => Some(end.saturating_sub(deliver_start) + 1),
+            None => match total {
+                Some(t) => Some(t.saturating_sub(deliver_start)),
+                None if client_range_start.is_some() => Some(MEDIA_CHUNK_LIMIT),
+                None => None,
+            },
+        };
+
+        let (client_status, content_range, content_length) = if client_range_start.is_some() {
+            // 带 Range: 206 + Content-Range。end 取本次实际交付的最后一字节。
+            let total_text = total
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "*".to_string());
+            match remaining {
+                Some(n) if n > 0 => {
+                    let end = deliver_start + n - 1;
+                    (
+                        206u16,
+                        Some(format!("bytes {deliver_start}-{end}/{total_text}")),
+                        Some(n),
+                    )
+                }
+                _ => (206u16, None, None),
+            }
+        } else {
+            // 无 Range: 标准 200 整包语义, 绝不回 206 —— 实测 WebKit 对
+            // 206-to-no-range 直接放弃(见方法注释)。
+            (200u16, None, remaining)
+        };
+
+        // 响应头此刻已齐, 字节流交给状态机边收边转; 播放器拿到响应头即可
+        // 开始缓冲/起播, 不再等整个文件。
+        let stream = media_forward_stream(
+            res,
+            initial_skip,
+            remaining,
+            deliver_start,
+            active_client,
+            spec.url.clone(),
+            spec.headers.clone(),
+        );
+        Ok(MediaStreamPayload {
+            status: client_status,
+            content_type: upstream_content_type
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            content_length,
+            content_range,
+            accept_ranges: Some(upstream_accept_ranges.unwrap_or_else(|| "bytes".to_string())),
+            stream: Box::pin(stream),
+        })
+    }
+
     /// 缓存命中时的解密补救。
     ///
     /// 修复前落盘的封面是**密文**（解密逻辑此前不存在），映射里记的
@@ -5956,6 +6161,268 @@ const MEDIA_RESUME_MAX: u32 = 3;
 /// 立刻重连又立刻被拆。
 const MEDIA_RESUME_BACKOFF_MS: u64 = 250;
 
+/// 流式路径的单请求总时长上限(覆盖 client 级 60s 总超时): 渐进式传输以分钟
+/// 计, 不能被总超时砍断; 2 小时足以覆盖任何现实中的点播, 又不至于让僵尸
+/// 连接无限挂起。
+const MEDIA_STREAM_REQUEST_CAP_SECS: u64 = 2 * 60 * 60;
+
+/// 流式路径整条响应内的续传次数预算: 直链全长可能被 CDN 掐断多次, 每次续传
+/// 对播放器完全透明, 预算取整读单块窗口(3 次)的 4 倍余量; 耗尽说明链路
+/// 已不可用, 让播放器报错整单重试。
+const MEDIA_STREAM_RESUME_MAX: u32 = 12;
+
+/// 回环 HTTP 媒体服务的流式载荷: 响应头 + 上游字节流(断流自动续传)。
+pub struct MediaStreamPayload {
+    /// 回给播放器的状态码: 无 Range 请求恒 200, 带 Range 恒 206。
+    pub status: u16,
+    pub content_type: String,
+    /// 本次响应体的字节总数(总长已知时), 用于设置 Content-Length。
+    pub content_length: Option<u64>,
+    /// 带 Range 请求的 Content-Range(`bytes N-M/total`)。
+    pub content_range: Option<String>,
+    pub accept_ranges: Option<String>,
+    pub stream: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<bytes::Bytes, anyhow::Error>> + Send>,
+    >,
+}
+
+/// 流式转发状态机状态([`media_forward_stream`] 的 unfold 载体)。
+struct MediaStreamState {
+    res: Option<reqwest::Response>,
+    /// 上游响应体还需丢弃的前缀(回包起点与交付起点不对齐时)。
+    to_skip: u64,
+    /// 本次交付的剩余字节上限(None = 到上游 EOF)。
+    remaining: Option<u64>,
+    /// 交付起点的绝对文件偏移(续传偏移与日志用)。
+    deliver_start: u64,
+    /// 已交付字节数。
+    produced: u64,
+    /// 已用续传次数。
+    resumes: u32,
+    done: bool,
+    client: reqwest::Client,
+    url: String,
+    headers: Vec<(String, String)>,
+    started: std::time::Instant,
+}
+
+/// 把上游响应体逐块转发成客户端字节流; 中断按绝对偏移重开上游连接续传。
+fn media_forward_stream(
+    res: reqwest::Response,
+    initial_skip: u64,
+    remaining: Option<u64>,
+    deliver_start: u64,
+    client: reqwest::Client,
+    url: String,
+    headers: Vec<(String, String)>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, anyhow::Error>> {
+    futures::stream::unfold(
+        MediaStreamState {
+            res: Some(res),
+            to_skip: initial_skip,
+            remaining,
+            deliver_start,
+            produced: 0,
+            resumes: 0,
+            done: false,
+            client,
+            url,
+            headers,
+            started: std::time::Instant::now(),
+        },
+        |mut st: MediaStreamState| async move {
+            loop {
+                if st.done || st.remaining == Some(0) {
+                    if st.remaining == Some(0) {
+                        tracing::info!(
+                            delivered = st.produced,
+                            resumes = st.resumes,
+                            elapsed_ms = st.started.elapsed().as_millis() as u64,
+                            "media stream window complete"
+                        );
+                    }
+                    return None;
+                }
+                // 借用安全: 先在受限作用域里完成 chunk() 读体(对 st.res 的
+                // &mut 借用只活在这个 match 表达式内), 拿到 owned 结果后再
+                // 自由读写/移交 st。
+                let read_result = match st.res.as_mut() {
+                    Some(res) => res.chunk().await,
+                    None => return None,
+                };
+                match read_result {
+                    Ok(Some(chunk)) => {
+                        let mut chunk = chunk;
+                        if st.to_skip > 0 {
+                            let n = chunk.len() as u64;
+                            if n <= st.to_skip {
+                                st.to_skip -= n;
+                                continue;
+                            }
+                            let _ = chunk.split_to(st.to_skip as usize);
+                            st.to_skip = 0;
+                        }
+                        if let Some(rem) = st.remaining {
+                            if chunk.len() as u64 > rem {
+                                let piece = chunk.split_to(rem as usize);
+                                st.remaining = Some(0);
+                                st.produced += rem;
+                                return Some((Ok(piece), st));
+                            }
+                            st.remaining = Some(rem - chunk.len() as u64);
+                        }
+                        st.produced += chunk.len() as u64;
+                        return Some((Ok(chunk), st));
+                    }
+                    Ok(None) => {
+                        // 上游读到 EOF: remaining 恰好耗尽算正常结束; 否则属
+                        // 提前终结 —— 已交付字节原样结束流, 播放器按
+                        // Content-Length 差额判定为截断并自行重试。
+                        st.done = true;
+                        if let Some(rem) = st.remaining {
+                            if rem > 0 {
+                                tracing::warn!(
+                                    delivered = st.produced,
+                                    remaining = rem,
+                                    elapsed_ms = st.started.elapsed().as_millis() as u64,
+                                    "media upstream ended before announced length"
+                                );
+                            } else {
+                                tracing::info!(
+                                    delivered = st.produced,
+                                    resumes = st.resumes,
+                                    elapsed_ms = st.started.elapsed().as_millis() as u64,
+                                    "media stream finished"
+                                );
+                            }
+                        }
+                        return None;
+                    }
+                    Err(err) => {
+                        if st.resumes >= MEDIA_STREAM_RESUME_MAX {
+                            tracing::error!(
+                                error = %err,
+                                delivered = st.produced,
+                                elapsed_ms = st.started.elapsed().as_millis() as u64,
+                                "media stream interrupted; resume budget exhausted"
+                            );
+                            st.done = true;
+                            return Some((
+                                Err(anyhow::anyhow!("media stream interrupted: {err}")),
+                                st,
+                            ));
+                        }
+                        st.resumes += 1;
+                        let next_offset = st.deliver_start + st.produced;
+                        tracing::warn!(
+                            offset = next_offset,
+                            attempt = st.resumes,
+                            delivered = st.produced,
+                            error = %err,
+                            "media stream interrupted; resuming by range"
+                        );
+                        sleep(Duration::from_millis(
+                            MEDIA_RESUME_BACKOFF_MS * st.resumes as u64,
+                        ))
+                        .await;
+                        match reopen_media_upstream(&st.client, &st.url, &st.headers, next_offset)
+                            .await
+                        {
+                            Ok((fresh, ranged)) => {
+                                let mut skip = if ranged { 0 } else { next_offset };
+                                if ranged {
+                                    if let Some((s, _e, _t)) = fresh
+                                        .headers()
+                                        .get(reqwest::header::CONTENT_RANGE)
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(parse_content_range)
+                                    {
+                                        if s > next_offset {
+                                            tracing::error!(
+                                                asked = next_offset,
+                                                got = s,
+                                                "media resume misaligned; giving up"
+                                            );
+                                            st.done = true;
+                                            return Some((
+                                                Err(anyhow::anyhow!(
+                                                    "media resume misaligned: asked {next_offset}, got {s}"
+                                                )),
+                                                st,
+                                            ));
+                                        }
+                                        skip = next_offset - s;
+                                    }
+                                }
+                                st.res = Some(fresh);
+                                st.to_skip = skip;
+                            }
+                            Err(reopen_err) => {
+                                tracing::warn!(
+                                    error = %reopen_err,
+                                    delivered = st.produced,
+                                    elapsed_ms = st.started.elapsed().as_millis() as u64,
+                                    "media resume failed; ending stream"
+                                );
+                                st.done = true;
+                                return Some((
+                                    Err(anyhow::anyhow!("media resume failed: {reopen_err}")),
+                                    st,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// 从指定绝对偏移重开上游媒体连接(流式续传); 返回 `(响应, 上游是否按区间回)`。
+async fn reopen_media_upstream(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+    offset: u64,
+) -> Result<(reqwest::Response, bool), anyhow::Error> {
+    let mut req = client.get(url);
+    for (name, value) in headers {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            req = req.header(name, value);
+        }
+    }
+    req = req.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+    req = req.header(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+    req = req.timeout(Duration::from_secs(MEDIA_STREAM_REQUEST_CAP_SECS));
+    let res = req.send().await?;
+    let status = res.status().as_u16();
+    if !(200..300).contains(&status) {
+        anyhow::bail!("media resume failed: {status}");
+    }
+    Ok((res, status == 206))
+}
+
+/// 解析客户端 Range 头的闭区间终点: `bytes=100-200` → `Some(200)`;
+/// 开放区间 `bytes=100-` 与后缀区间 `bytes=-200` 均无确定终点 → `None`。
+fn parse_range_end(range_header: Option<&str>) -> Option<u64> {
+    let value = range_header?.trim();
+    let spec = value.strip_prefix("bytes=")?.trim();
+    let first = spec.split(',').next()?.trim();
+    let (_, end) = first.split_once('-')?;
+    let end = end.trim();
+    if end.is_empty() {
+        None
+    } else {
+        end.parse::<u64>().ok()
+    }
+}
+
 /// 解析客户端 Range 头的起点: `bytes=100-` / `bytes=100-200` → `Some(100)`。
 ///
 /// `bytes=-500`(后缀区间)没有确定起点、多区间 Range(`0-1,5-9`)不合法,
@@ -6094,7 +6561,7 @@ where
 }
 
 /// 仅按 URL 判别播放列表(发请求前唯一可用的判据)。
-fn media_url_is_playlist_by_url(url: &str) -> bool {
+pub(crate) fn media_url_is_playlist_by_url(url: &str) -> bool {
     let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
     path.ends_with(".m3u8")
 }
@@ -6530,6 +6997,18 @@ mod tests {
         assert_eq!(parse_range_start(Some("bytes=-500")), None);
         assert_eq!(parse_range_start(Some("other=0-")), None);
         assert_eq!(parse_range_start(None), None);
+    }
+
+    /// 客户端 Range 终点解析: 闭区间有值, 开放/后缀区间没有。
+    #[test]
+    fn parse_range_end_covers_closed_open_and_suffix_forms() {
+        assert_eq!(parse_range_end(Some("bytes=100-199")), Some(199));
+        assert_eq!(parse_range_end(Some("bytes=0-1445")), Some(1445));
+        assert_eq!(parse_range_end(Some(" bytes=100-199 ")), Some(199));
+        assert_eq!(parse_range_end(Some("bytes=100-")), None);
+        assert_eq!(parse_range_end(Some("bytes=-500")), None);
+        assert_eq!(parse_range_end(Some("other=0-9")), None);
+        assert_eq!(parse_range_end(None), None);
     }
 
     /// 上游 Content-Range 解析: 标准空格分隔、`bytes=` 写法、未知总长(`*`)。

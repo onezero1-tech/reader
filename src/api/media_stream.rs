@@ -12,11 +12,20 @@
 //! WebKit 内部把协议响应映射给 GStreamer 源的那一环, 应用侧无法修复。
 //!
 //! 解法是绕开它: 在 `127.0.0.1:{随机端口}` 上起一个**仅媒体**的 axum 服务,
-//! 处理逻辑原样复用 [`crate::api::protocol::media_route`](Range/206/分块
-//! 截断/播放列表改写全一致)。`<video>` 拿到 `http://127.0.0.1:...` 的地址,
-//! 由内核 socket 承载标准 HTTP —— WebKit 的 soup 源对 Range/206 的支持
-//! 与普通网站完全相同。HLS 不受影响(hls.js 用 fetch 拉整个响应, 协议路径
-//! 一直正常), 暂不改道。
+//! `<video>` 拿到 `http://127.0.0.1:...` 的地址, 由内核 socket 承载标准
+//! HTTP —— WebKit 的 soup 源对 Range/206 的支持与普通网站完全相同。
+//!
+//! ## 响应形态(真流式, 见 `protocol::media_route_stream`)
+//!
+//! 消费者只有 `<video>` 原生媒体栈, 其首个媒体请求**不带 Range** —— 对这种
+//! 请求回标准 `200 + Content-Length(总长)` 的流式响应, 后端边从上游收边转发;
+//! 带 Range 的请求(嗅探/拖进度条)回 206 + Content-Range 流式区间。上游中断
+//! 由后端按偏移续传, 对播放器透明。分块截断(206 + 单块 body)在这里已废弃:
+//! 实测对无 Range 请求回 206 违反 HTTP 语义, WebKit 拿到第一块 4MiB 后直接
+//! 放弃, 再无后续请求。播放列表(.m3u8)体量小且要整体改写分片地址, 原样回落
+//! 整读的 `protocol::media_route`。
+//!
+//! HLS 不受影响(hls.js 用 fetch 拉整个响应, 协议路径一直正常), 暂不改道。
 //!
 //! ## 安全
 //!
@@ -27,10 +36,10 @@
 
 use crate::api::AppState;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, RANGE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::header::RANGE;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::any;
 use axum::Router;
 use rand::RngCore;
 use std::sync::OnceLock;
@@ -63,7 +72,8 @@ pub async fn start(state: AppState) {
     let _ = BASE_URL.set(format!("http://127.0.0.1:{port}/{token}"));
 
     let app = Router::new()
-        .route("/:token/media", get(media))
+        // any(): 媒体栈偶尔会先发 HEAD 探测, GET-only 会直接 405 把管线打死。
+        .route("/:token/media", any(media))
         .with_state(state);
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
@@ -73,8 +83,8 @@ pub async fn start(state: AppState) {
     tracing::info!(port, "media loopback server ready (mp4 direct links)");
 }
 
-/// `GET /{token}/media?path=...&source=...` —— 查询串原样转交
-/// [`crate::api::protocol::media_route`]。
+/// `GET|HEAD /{token}/media?path=...&source=...` —— 查询串与 Range 头原样转交
+/// [`crate::api::protocol::media_route_stream`](真流式: 200/206 + 后端断流续传)。
 async fn media(
     State(state): State<AppState>,
     Path(path_token): Path<String>,
@@ -86,24 +96,7 @@ async fn media(
     }
     let query = raw_query.unwrap_or_default();
     let range = headers.get(RANGE).and_then(|v| v.to_str().ok());
-    // slice_unranged = true: 本路径只有 <video> 原生媒体栈, 其首个媒体请求
-    // 不带 Range —— 后端据此给上游强制 bytes=0- 并按块回传, 直链不再整读
-    // (整读既慢又容易在长传输中被 CDN 掐断)。详见 book_service 注释。
-    let proxied =
-        crate::api::protocol::media_route(&state, &query, range, true).await;
-    // 允许任意来源跨域读取: 服务有 token 把门, 且这给未来 HLS 整体迁移到
-    // 回环 HTTP(hls.js 的 fetch 需要 CORS)留好路。
-    let (parts, body) = proxied.into_parts();
-    let mut builder = axum::http::Response::builder().status(parts.status);
-    builder = builder.header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    for (name, value) in parts.headers.iter() {
-        builder = builder.header(name, value);
-    }
-    match builder.body(axum::body::Body::from(body)) {
-        Ok(resp) => resp.into_response(),
-        // 头部非法(上游返回了无法编码的头)才走到这里; 与门禁一样不给细节。
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    crate::api::protocol::media_route_stream(&state, &query, range).await
 }
 
 /// 门禁判定(纯函数便于单测): 路径段 token 必须与进程 token 完全一致;

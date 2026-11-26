@@ -12,6 +12,7 @@ use crate::api::AppState;
 use crate::error::error::AppError;
 use crate::model::book_source::BookSource;
 use crate::util::text::{normalize_source_url, repair_encoded_url};
+use axum::response::IntoResponse;
 use regex::{Captures, Regex};
 use std::collections::HashMap;
 use tauri::http;
@@ -893,6 +894,126 @@ pub async fn media_route(
                 .unwrap_or_default()
         }
     }
+}
+
+/// 媒体代理(流式): 与 [`media_route`] 同参, 供回环 HTTP 服务
+/// (`api::media_stream`)使用, 返回 axum 响应 —— 响应体是字节流而非整块 Vec。
+/// 与整读路径的行为差异:
+/// - 无 Range → 标准 200 + Content-Length(总长), 后端边从上游收边转发;
+/// - 带 Range → 206 + Content-Range, 同样流式;
+/// - 上游中断由后端按偏移续传, 对播放器透明(见 book_service
+///   `get_media_stream_for_source`);
+/// - 上游失败回 502(区别于路由/参数问题的 404), 播放器立刻报错而不是干等。
+///
+/// 播放列表(.m3u8)体量小且要整体改写分片地址, 原样回落整读的 [`media_route`]
+/// (回环路径上播放列表只可能来自非 mp4 直链的兜底, 正常不会走到)。
+pub async fn media_route_stream(
+    state: &AppState,
+    query: &str,
+    range_header: Option<&str>,
+) -> axum::response::Response {
+    let params: HashMap<String, String> =
+        serde_urlencoded::from_str(query).unwrap_or_default();
+    let url = params.get("path").map(String::as_str).unwrap_or_default();
+    if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
+    let source = resolve_cover_source(state, params.get("source").map(String::as_str), url).await;
+    let started = std::time::Instant::now();
+    let log_target = media_log_target(url);
+    tracing::info!(
+        target = %log_target,
+        via = "loopback",
+        range = range_header.unwrap_or("-"),
+        "media proxy request"
+    );
+
+    if crate::service::book_service::media_url_is_playlist_by_url(url) {
+        let buffered = media_route(state, query, range_header, true).await;
+        tracing::info!(
+            target = %log_target,
+            via = "loopback",
+            playlist = true,
+            bytes = buffered.body().len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "media proxy response (playlist buffered)"
+        );
+        return buffered_to_axum(buffered);
+    }
+
+    match state
+        .book_service
+        .get_media_stream_for_source("public", url, source.as_ref(), range_header)
+        .await
+    {
+        Ok(payload) => {
+            tracing::info!(
+                target = %log_target,
+                via = "loopback",
+                range = range_header.unwrap_or("-"),
+                status = payload.status,
+                content_type = %payload.content_type,
+                content_range = payload.content_range.as_deref().unwrap_or("-"),
+                content_length = payload.content_length.unwrap_or(0),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "media proxy response (streaming)"
+            );
+            let mut builder = axum::http::Response::builder().status(
+                axum::http::StatusCode::from_u16(payload.status)
+                    .unwrap_or(axum::http::StatusCode::OK),
+            );
+            if let Ok(value) = axum::http::HeaderValue::from_str(&payload.content_type) {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, value);
+            }
+            if let Some(range_value) = &payload.content_range {
+                if let Ok(value) = axum::http::HeaderValue::from_str(range_value) {
+                    builder = builder.header(axum::http::header::CONTENT_RANGE, value);
+                }
+            }
+            if let Some(accept) = &payload.accept_ranges {
+                if let Ok(value) = axum::http::HeaderValue::from_str(accept) {
+                    builder = builder.header(axum::http::header::ACCEPT_RANGES, value);
+                }
+            }
+            if let Some(len) = payload.content_length {
+                builder = builder.header(axum::http::header::CONTENT_LENGTH, len);
+            }
+            // 播放地址带签名时效, 流式响应同样禁止缓存; 区间响应更不能缓存。
+            builder
+                .header(axum::http::header::CACHE_CONTROL, "no-store")
+                .header("access-control-allow-origin", "*")
+                .header("cross-origin-resource-policy", "cross-origin")
+                .body(axum::body::Body::from_stream(payload.stream))
+                .unwrap_or_else(|_| axum::http::StatusCode::BAD_GATEWAY.into_response())
+        }
+        Err(err) => {
+            tracing::warn!(
+                target = %log_target,
+                via = "loopback",
+                range = range_header.unwrap_or("-"),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %err,
+                "media proxy failed"
+            );
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("media upstream failed: {err}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// tauri 自定义协议用的整块响应 → axum 响应(回环服务的播放列表回落路径)。
+fn buffered_to_axum(resp: tauri::http::Response<Vec<u8>>) -> axum::response::Response {
+    let (parts, body) = resp.into_parts();
+    let mut builder = axum::http::Response::builder().status(parts.status);
+    for (name, value) in parts.headers.iter() {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// 日志用的媒体地址: 去掉签名 query 与 fragment, 只留 host+path 并截短。
