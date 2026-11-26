@@ -160,3 +160,13 @@ int unlinkat(int dirfd, const char *pathname, int flags) {
     free(new_path);
     return ret;
 }
+
+int remove(const char *pathname) {
+    static int (*real_fn)(const char *) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "remove");
+    char *new_path = rewrite_path(pathname);
+    int ret = real_fn(new_path ? new_path : pathname);
+    free(new_path);
+    return ret;
+}
+
