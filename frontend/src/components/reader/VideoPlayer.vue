@@ -13,7 +13,7 @@
  * 网络层致命错误时自动用 `forceRefresh` 重取一次正文(父组件监听 retry 事件),
  * 不需要用户手动清理缓存。
  */
-import { onBeforeUnmount, ref, watch } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { toLoopbackMediaUrl } from '../../api/mediaStream'
 import { isTauriRuntime } from '../../api/transport'
@@ -324,7 +324,24 @@ function onVideoError() {
     : '视频加载失败（地址失效或网络异常），请点击重试'
 }
 
-watch(() => props.src, attach, { immediate: true })
+// ── 初始化时序 ──
+//
+// 旧实现 `watch(() => props.src, attach, { immediate: true })` 有一个挂载时序
+// 缺陷: immediate 回调在 setup() 里同步执行, 此时模板 ref(videoRef)还没绑定
+// —— attach() 里 `videoRef.value` 为 null, 直接 return, 播放器从未初始化。
+//
+// 这个缺陷只在「组件首挂载时就带着最终播放地址」的路径上暴露:
+// - 从目录跳章: 目标章通常没有被预载, 加载期间 v-if 会卸载整个播放器,
+//   正文到位后带着真实 src 重新挂载 → immediate 回调空跑, 永远不起播;
+// - 首次打开视频书同理(正文到达后播放器才首次挂载)。
+// 而「上一集/下一集」之所以正常, 是因为相邻章节几乎总在 preload 缓存里,
+// loading 不闪、播放器保持挂载, src 变化触发的是挂载后的普通 watch。
+//
+// 修复: 挂载完成(ref 已绑定)后再 attach; src 的后续变化仍交给 watch。
+// 挂载时 src 为空(正文还没识别出媒体地址)也无妨 —— attach 会安全返回,
+// 等 src 从 '' 变为真实地址时 watch 自然接管。
+onMounted(attach)
+watch(() => props.src, attach)
 onBeforeUnmount(destroy)
 </script>
 
